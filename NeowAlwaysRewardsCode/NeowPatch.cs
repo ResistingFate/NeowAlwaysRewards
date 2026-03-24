@@ -18,6 +18,7 @@ using MegaCrit.Sts2.Core.Random;
 
 namespace NeowAlwaysRewards.NeowAlwaysRewardsCode;
 
+
 [HarmonyPatch]
 public static class NeowPatch
 {
@@ -30,6 +31,7 @@ public static class NeowPatch
         )!;
     }
 
+    // Not sure how other mods will use this method yetand where this should be by context
     static bool Prefix(Neow __instance, Func<Task> modifierFunc, int index, ref Task __result)
     {
         __result = Run(__instance, modifierFunc, index);
@@ -64,7 +66,7 @@ public static class NeowPatch
 
         GD.Print("[NeowAlwaysRewards] Last modifier option completed. Generating vanilla Neow rewards.");
 
-        IReadOnlyList<EventOption> rewards = BuildVanillaRewardsIgnoringModifiers(neow);
+        IReadOnlyList<EventOption> rewards = NeowRewardHelper.BuildVanillaRewardsIgnoringModifiers(neow);
 
         GD.Print($"[NeowAlwaysRewards] Vanilla reward count after modifier queue: {rewards.Count}");
         foreach (var opt in rewards)
@@ -79,7 +81,7 @@ public static class NeowPatch
             GD.Print($"[NeowAlwaysRewards] rewards.Count = {rewards.Count}");
             if (initialDescription is LocString loc)
             {
-                GD.Print($"[NeowAlwaysRewards] initialDescription = {loc.GetFormattedText()}");
+                GD.Print($"[NeowAlwaysRewards] initialDescription = {NeowRewardHelper.DebugLocSafe(loc)}");
             }
             SetEventState(neow, initialDescription, rewards);
             return;
@@ -170,6 +172,8 @@ public static class NeowPatch
 [HarmonyPatch(typeof(Neow), "GenerateInitialOptions")]
 public static class NeowGenerateInitialOptionsFallbackPatch
 {
+    [HarmonyPriority(Priority.Low)]
+    // Can add more rules if needed using [HarmonyAfter(new[] { "other.mod.id" })]
     static void Postfix(Neow __instance, ref IReadOnlyList<EventOption> __result)
     {
         var tr = Traverse.Create(__instance);
@@ -183,8 +187,11 @@ public static class NeowGenerateInitialOptionsFallbackPatch
 
         if (__result.Count > 0)
             return; // vanilla already gave us modifier options
-
-        IReadOnlyList<EventOption> rewards = NeowRewardHelper.BuildNormalRewards(__instance);
+        
+        if (NeowRewardHelper.ShouldSkipGenerateInitialOptionsPostfix())
+            return;
+        IReadOnlyList<EventOption> rewards = NeowRewardHelper.BuildVanillaRewardsIgnoringModifiers(__instance);
+        
         if (rewards.Count > 0)
         {
             GD.Print("[NeowAlwaysRewards] No modifier Neow options; using normal Neow rewards.");
@@ -195,83 +202,64 @@ public static class NeowGenerateInitialOptionsFallbackPatch
 
 public static class NeowRewardHelper
 {
-    public static IReadOnlyList<EventOption> BuildNormalRewards(Neow neow)
+    [ThreadStatic]
+    private static bool _buildingRewardsIgnoringModifiers;
+    
+    public static bool ShouldSkipGenerateInitialOptionsPostfix()
     {
-        var tr = Traverse.Create(neow);
-
-        Player? owner = tr.Property("Owner").GetValue<Player>();
-        Rng? rng = tr.Property("Rng").GetValue<Rng>();
-
-        if (owner is null || rng is null)
+        return _buildingRewardsIgnoringModifiers;
+    }
+    
+    public static IReadOnlyList<EventOption> BuildVanillaRewardsIgnoringModifiers(Neow neow)
+    {
+        if (_buildingRewardsIgnoringModifiers)
             return Array.Empty<EventOption>();
 
-        List<EventOption> list1 =
-            tr.Property("CurseOptions").GetValue<IEnumerable<EventOption>>()?.ToList()
-            ?? new List<EventOption>();
+        var neowTr = Traverse.Create(neow);
 
-        List<EventOption> list2 =
-            tr.Property("PositiveOptions").GetValue<IEnumerable<EventOption>>()?.ToList()
-            ?? new List<EventOption>();
-
-        if (ScrollBoxes.CanGenerateBundles(owner))
-            AddIfNotNull(list1, tr.Property("ScrollBoxesOption").GetValue<EventOption>());
-
-        if (owner.RunState.Players.Count == 1)
-            AddIfNotNull(list1, tr.Property("SilverCrucibleOption").GetValue<EventOption>());
-
-        if (list1.Count == 0 || list2.Count == 0)
+        Player? owner = neowTr.Property("Owner").GetValue<Player>();
+        if (owner is null)
             return Array.Empty<EventOption>();
 
-        EventOption? eventOption = rng.NextItem<EventOption>(list1);
-        if (eventOption is null)
-            return Array.Empty<EventOption>();
+        var runStateTr = Traverse.Create(owner.RunState);
 
-        if (eventOption.Relic is CursedPearl)
-            list2.RemoveAll(o => o.Relic is GoldenPearl);
+        IReadOnlyList<ModifierModel> savedModifiers =
+            runStateTr.Property("Modifiers").GetValue<IReadOnlyList<ModifierModel>>()
+            ?? Array.Empty<ModifierModel>();
 
-        if (eventOption.Relic is HeftyTablet)
-            list2.RemoveAll(o => o.Relic is ArcaneScroll);
-
-        if (eventOption.Relic is LeafyPoultice)
-            list2.RemoveAll(o => o.Relic is NewLeaf);
-
-        if (eventOption.Relic is PrecariousShears)
-            list2.RemoveAll(o => o.Relic is PreciseScissors);
-
-        if (eventOption.Relic is not LargeCapsule)
+        try
         {
-            AddIfNotNull(
-                list2,
-                rng.NextBool()
-                    ? tr.Property("LavaRockOption").GetValue<EventOption>()
-                    : tr.Property("SmallCapsuleOption").GetValue<EventOption>());
+            _buildingRewardsIgnoringModifiers = true;
+
+            runStateTr.Property("Modifiers")
+                .SetValue((IReadOnlyList<ModifierModel>)Array.Empty<ModifierModel>());
+
+            var method = AccessTools.Method(typeof(Neow), "GenerateInitialOptions");
+            if (method is null)
+                return Array.Empty<EventOption>();
+
+            return method.Invoke(neow, null) as IReadOnlyList<EventOption>
+                   ?? Array.Empty<EventOption>();
         }
-
-        AddIfNotNull(
-            list2,
-            rng.NextBool()
-                ? tr.Property("NutritiousOysterOption").GetValue<EventOption>()
-                : tr.Property("StoneHumidifierOption").GetValue<EventOption>());
-
-        AddIfNotNull(
-            list2,
-            rng.NextBool()
-                ? tr.Property("NeowsTalismanOption").GetValue<EventOption>()
-                : tr.Property("PomanderOption").GetValue<EventOption>());
-
-        if (owner.RunState.Players.Count > 1)
-            AddIfNotNull(list2, tr.Property("MassiveScrollOption").GetValue<EventOption>());
-
-        List<EventOption> items = new();
-        items.AddRange(list2.UnstableShuffle(rng).Take(2));
-        items.Add(eventOption);
-
-        return items;
+        finally
+        {
+            runStateTr.Property("Modifiers").SetValue(savedModifiers);
+            _buildingRewardsIgnoringModifiers = false;
+        }
     }
 
-    private static void AddIfNotNull(List<EventOption> list, EventOption? option)
+    public static string DebugLocSafe(LocString? loc)
     {
-        if (option is not null)
-            list.Add(option);
+        if (loc is null)
+            return "<null>";
+
+        try
+        {
+            return $"{loc.GetFormattedText()} (key={loc.LocTable}:{loc.LocEntryKey})";
+        }
+        catch
+        {
+            return $"<{loc.LocTable}.{loc.LocEntryKey}>";
+        }
     }
 }
