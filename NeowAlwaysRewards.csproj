@@ -86,7 +86,7 @@
 
     <ItemGroup>
         <!--<PackageReference Include="Alchyr.Sts2.BaseLib" Version="0.1.9" PrivateAssets="All" /> -->
-        <PackageReference Include="Alchyr.Sts2.ModAnalyzers" Version="*"/>
+        <PackageReference Include="Alchyr.Sts2.ModAnalyzers" Version="0.1.6" />
         <AdditionalFiles Include="NeowAlwaysRewards/localization/**/*.json"/>
     </ItemGroup>
 
