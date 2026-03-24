@@ -69,5 +69,7 @@ Future work
 - Trim remaining debug logging
 - Multiplayer testing
 
-```
-
+## Build
+- I followed Alchyr's guide with JellyBeans Rider and use their templates:
+https://github.com/Alchyr/ModTemplate-StS2/wiki
+- I made a Claude.md for working with AI fors making Slay the Spire 2 mods
