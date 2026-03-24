@@ -2,7 +2,7 @@
 
 NeowAlwaysRewards makes normal Neow rewards available in custom and challenge-style runs, not just standard runs.
 
-[How It Looks](NeowAlwaysRewards/NeowAlwaysRewards.gif)
+<img src="NeowAlwaysRewards/NeowAlwaysRewards.gif" alt="Alt Text" width="480" />
 
 ## What it does
 
