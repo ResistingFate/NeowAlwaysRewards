@@ -4,9 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-03-25
+
 ### Changed
-- Reworked Neow reward handling so standard Neow rewards can appear in custom runs and challenge-style runs, not only standard runs.
-- Preserved the vanilla modifier/challenge Neow flow for challenge modifiers that generate their own interactive Neow option, such as Sealed Deck and Draft.
+- Reworked Neow reward handling so standard Neow rewards can appear in custom runs and daily challenge runs, not only standard runs.
+- Preserved the vanilla modifier/challenge Neow flow for custom run modifiers that generate their own interactive Neow option, such as Sealed Deck and Draft.
 - Modifier-driven Neow options now chain into the normal Neow reward flow instead of ending the event immediately after the final modifier option.
 - Added fallback behavior for modifier runs that do not generate interactive modifier Neow options, allowing them to receive normal Neow rewards.
 

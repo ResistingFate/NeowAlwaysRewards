@@ -1,30 +1,30 @@
 ﻿# NeowAlwaysRewards
 
-NeowAlwaysRewards makes normal Neow rewards available in custom and challenge-style runs, not just standard runs.
+NeowAlwaysRewards allows Neow rewards show in custom mode and Daily Challenge runs, not just standard runs.
 
 <img src="NeowAlwaysRewards/NeowAlwaysRewards.gif" alt="Alt Text" width="480" />
 
 ## What it does
 
-In vanilla, runs with modifiers can take a different Neow path that only presents modifier-specific challenge options. This mod preserves that flow, then chains normal Neow rewards afterward.
+In vanilla, Neow gives blessings only in standard mode. The reason is likely with Custom Game's Challenge Modifiers like **Draft**, **Sealed Deck**, **Specialize**, **Insanity**, and **All Stars** as they actually count as a clickable blessing when you spawn in with Neow. With this mod, you'll get **Any** of the modifiers you picked first as rewards and then Neow will give you his usual Blessings. Mods that expand the Neow's blessing are designed to appear as they normally would.
 
-### Result
-- Standard runs: vanilla Neow behavior
-- Custom runs without interactive modifier Neow options: normal Neow rewards appear
-- Custom runs with modifier-driven Neow options (for example Sealed Deck / Draft style flows): modifier options appear first, then normal Neow rewards
+### Works for:
+- Standard Runs
+- Daily Runs
+- Custom Runs with no extra Neow choices
+- Custom Runs with any number of extra Neow choices
 
 ## How it works
 
-The mod does not permanently replace all of Neow’s reward logic.
-
-Instead it:
+The mod replaces OnModifierOptionsSelected method in the Neow class using a Harmony Prefix. I chose that method as I didn't see many mods changing that method.
+I have put a Harmony Postfix for the GenerateInitialOption method which low priority as it should really run last. What it does is temporarily clear the modifiers and call the original GenerateInitialOptions so the Neow Rewards will show. After that is done the modifiers are restored. I add guarding to stop GenerateInitialOptions from replaying more than once to avoid infinite recursion. In detail:
 - preserves the vanilla modifier-option sequence
 - detects when the final modifier option has resolved
 - temporarily swaps `RunState.Modifiers` to an empty `IReadOnlyList`
 - calls vanilla `GenerateInitialOptions()`
 - restores the original modifiers
 
-That lets the game generate the normal Neow rewards using current vanilla logic.
+That lets the game generate the normal Neow rewards using the current vanilla logic or any Postfix a mod adds.
 
 ## Why this approach
 
@@ -32,7 +32,7 @@ This is more robust than copying and editing the full `GenerateInitialOptions()`
 
 Benefits:
 - less fragile across game updates
-- preserves modifier/challenge-specific Neow flows
+- preserves all Custom Run Modifier flows
 - better compatibility with other mods that postfix `GenerateInitialOptions()`
 
 ## Compatibility
@@ -42,7 +42,7 @@ This mod is designed to be relatively friendly to other mods that modify Neow re
 - append a fourth choice
 - alter the final returned option list
 
-Patch order can still matter when multiple mods postfix the same method.
+Patch order can still matter when multiple mods postfix the same method if you also use Harmony Priority Low.
 
 ## Files
 
@@ -55,24 +55,19 @@ Patch order can still matter when multiple mods postfix the same method.
 Place the mod in:
 
 ```text
-Slay the Spire 2/mods/NeowAlwaysRewards/
-Expected contents:
-
-NeowAlwaysRewards.dll
-NeowAlwaysRewards.pck
-mod_manifest.json
-Status
+Slay the Spire 2/
+  mods/
+    NeowAlwaysRewards/
+      NeowAlwaysRewards.dll
+      NeowAlwaysRewards.pck
+      NeowAlwaysRewardsjson
 ```
-Working for:
-- standard runs
-- custom runs
-- challenge/modifier Neow flows
-- modifier runs with or without interactive Neow challenge options
 
 Future work
 - Monitor patch order interactions with other Neow mods
 - Add explicit Harmony ordering if needed
 - Trim remaining debug logging
+- Multiplayer testing
 
 ```
 
