@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-03-26
+
+### Fixed
+- Fixed compatibility with mods thas was lost in 1.1.0 (Using SoulCapture as a base to test).
+- Fixed final Neow reward reconstruction dropping third-party `GenerateInitialOptions()` postfix-added options during multiplayer-safe reward rebuilding.
+
+### Technical
+- Extended the cached Neow reward snapshot in `NeowRewardHelper` from a key-only vanilla cache to a mixed cache model.
+- Cached reward entries are now tracked as either:
+  - `LiveVanilla` entries, rebuilt from fresh `neow.AllPossibleOptions`, or
+  - `GeneratedOnly` entries, restored from the originally generated cached `EventOption`.
+- Updated `BuildAndCacheVanillaRewardKeys(...)` to record whether each generated reward came from vanilla live options or from a generated-only modded option.
+- Updated `GetOrBuildLiveVanillaRewardsFromCachedKeys(...)` to:
+  - rebuild vanilla blessings from fresh live options in cached order, and
+  - fall back to cached generated options for third-party Neow rewards not present in `AllPossibleOptions`.
+- Preserved the multiplayer-safe live-option rebuild path while restoring compatibility with mods such as SoulCapture that append Neow options in a `GenerateInitialOptions()` postfix.
+- Added extra debug state output for cached reward kinds and generated-only option keys to verify mixed-cache reconstruction in logs.
+
 ## [1.1.0] - 2026-03-26
 
 ### Fixed
