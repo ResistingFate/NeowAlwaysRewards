@@ -38,13 +38,14 @@ public static class NeowPatch
     private static bool Prefix(Neow __instance, Func<Task> modifierFunc, int index, ref Task __result)
     {
         // Replace the vanilla modifier flow so custom run modifiers still chain one-by-one,
-        // but rebuild the final blessing page from fresh live vanilla EventOptions.
+        // but rebuild the final blessing page from fresh live vanilla EventOptions where possible.
         //
         // The key difference from the previous version is:
-        // - we do NOT reuse cached EventOption instances
+        // - we do NOT reuse cached vanilla EventOption instances
         // - we do NOT wrap cached EventOption callbacks
-        // - we only cache the final blessing TEXT KEYS early
+        // - we cache the final blessing TEXT KEYS early, plus any generated-only third-party options
         // - when the last modifier finishes, we rebuild fresh live options from neow.AllPossibleOptions
+        //   and only fall back to the cached generated option when no live vanilla option exists
         //
         // That keeps the page progression fix that multiplayer needed, while letting the final
         // blessing choice run through a much more vanilla-looking callback path.
@@ -243,8 +244,9 @@ public static class NeowGenerateInitialOptionsCachePatch
     [HarmonyPriority(Priority.Low)]
     private static void Postfix(Neow __instance, ref IReadOnlyList<EventOption> __result)
     {
-        // Cache the final blessing KEYS early, before the modifier chain advances.
-        // This freezes the RNG result up front without reusing old EventOption instances later.
+        // Cache the final blessing result early, before the modifier chain advances.
+        // Vanilla blessings are remembered by key so they can be rebuilt live later,
+        // while generated-only third-party options can be preserved as a fallback.
         Player? owner = Traverse.Create(__instance).Property("Owner").GetValue<Player>();
         if (owner is null)
             return;
@@ -351,11 +353,26 @@ public static class NeowRewardHelper
     [ThreadStatic]
     private static bool _buildingRewardsIgnoringModifiers;
 
+    private enum CachedRewardSourceKind
+    {
+        LiveVanilla,
+        GeneratedOnly
+    }
+
+    private sealed class CachedRewardOption
+    {
+        public string Key { get; init; } = string.Empty;
+        public string RelicEntry { get; init; } = string.Empty;
+        public CachedRewardSourceKind SourceKind { get; init; }
+        public EventOption? GeneratedOption { get; init; }
+    }
+
     private sealed class CachedRewardKeys
     {
-        public List<string> Keys { get; init; } = new();
-        public List<string> RelicEntries { get; init; } = new();
-        public string Reason { get; init; } = string.Empty;
+        public List<CachedRewardOption> Options { get; set; } = new();
+        public List<string> Keys { get; set; } = new();
+        public List<string> RelicEntries { get; set; } = new();
+        public string Reason { get; set; } = string.Empty;
     }
 
     private static readonly ConditionalWeakTable<Neow, CachedRewardKeys> CachedRewardKeysByNeow = new();
@@ -366,8 +383,11 @@ public static class NeowRewardHelper
     }
 
     /// <summary>
-    /// Build the vanilla blessing page by temporarily ignoring custom-run modifiers,
-    /// but only keep a lightweight snapshot of the chosen option keys and relic ids.
+    /// Build the blessing page by temporarily ignoring custom-run modifiers,
+    /// then cache a lightweight snapshot of the chosen option keys and relic ids.
+    ///
+    /// Vanilla rewards are cached by key so they can be rebuilt from live options later.
+    /// Third-party rewards that only exist in the generated result are kept as generated-option fallbacks.
     /// </summary>
     public static IReadOnlyList<string> GetOrBuildCachedVanillaRewardKeys(Neow neow, string reason)
     {
@@ -379,12 +399,15 @@ public static class NeowRewardHelper
 
     /// <summary>
     /// Rebuild fresh live EventOptions from neow.AllPossibleOptions using the cached key order.
-    /// This avoids reusing stale EventOption instances and keeps the live callbacks vanilla.
+    /// This avoids reusing stale vanilla EventOption instances and keeps the live callbacks vanilla.
+    ///
+    /// If a cached reward came from another mod and only existed in the generated result,
+    /// fall back to that cached generated option so compatibility options like Soul Capture survive.
     /// </summary>
     public static IReadOnlyList<EventOption> GetOrBuildLiveVanillaRewardsFromCachedKeys(Neow neow, string reason)
     {
-        IReadOnlyList<string> keys = GetOrBuildCachedVanillaRewardKeys(neow, reason);
-        if (keys.Count <= 0)
+        CachedRewardKeys snapshot = GetOrBuildCachedRewardSnapshot(neow, reason);
+        if (snapshot.Options.Count <= 0)
             return Array.Empty<EventOption>();
 
         List<EventOption> allLiveOptions = neow.AllPossibleOptions?.ToList() ?? new List<EventOption>();
@@ -394,19 +417,31 @@ public static class NeowRewardHelper
             .ToDictionary(group => group.Key, group => group.First());
 
         List<EventOption> rebuilt = new();
-        foreach (string key in keys)
+        foreach (CachedRewardOption cached in snapshot.Options)
         {
-            if (!byKey.TryGetValue(key, out EventOption? live))
+            if (byKey.TryGetValue(cached.Key, out EventOption? live))
             {
-                GD.PrintErr(
-                    $"{LogPrefix} Failed to rebuild live vanilla reward for owner={GetOwnerId(neow)} key={key}. " +
-                    $"Available keys={string.Join(",", byKey.Keys.OrderBy(x => x))}"
-                );
+                AttachDebugBeforeChosen(neow, live, reason);
+                rebuilt.Add(live);
                 continue;
             }
 
-            AttachDebugBeforeChosen(neow, live, reason);
-            rebuilt.Add(live);
+            if (cached.GeneratedOption is not null)
+            {
+                GD.Print(
+                    $"{LogPrefix} Using cached generated reward fallback for owner={GetOwnerId(neow)} reason={reason} " +
+                    $"key={cached.Key} relic={cached.RelicEntry}"
+                );
+
+                AttachDebugBeforeChosen(neow, cached.GeneratedOption, reason);
+                rebuilt.Add(cached.GeneratedOption);
+                continue;
+            }
+
+            GD.PrintErr(
+                $"{LogPrefix} Failed to rebuild reward for owner={GetOwnerId(neow)} key={cached.Key}. " +
+                $"Available live keys={string.Join(",", byKey.Keys.OrderBy(x => x))}"
+            );
         }
 
         GD.Print(
@@ -414,6 +449,19 @@ public static class NeowRewardHelper
         );
 
         return rebuilt;
+    }
+
+    private static CachedRewardKeys GetOrBuildCachedRewardSnapshot(Neow neow, string reason)
+    {
+        if (CachedRewardKeysByNeow.TryGetValue(neow, out CachedRewardKeys? cached))
+            return cached;
+
+        BuildAndCacheVanillaRewardKeys(neow, reason);
+
+        if (CachedRewardKeysByNeow.TryGetValue(neow, out cached))
+            return cached;
+
+        return new CachedRewardKeys();
     }
 
     private static IReadOnlyList<string> BuildAndCacheVanillaRewardKeys(Neow neow, string reason)
@@ -449,21 +497,43 @@ public static class NeowRewardHelper
                 generateInitialOptionsMethod.Invoke(neow, Array.Empty<object>()) as IReadOnlyList<EventOption>
                 ?? Array.Empty<EventOption>();
 
+            HashSet<string> liveKeys = (neow.AllPossibleOptions ?? Array.Empty<EventOption>())
+                .Select(DebugOptionKey)
+                .Where(key => !string.IsNullOrEmpty(key))
+                .ToHashSet();
+
             CachedRewardKeys snapshot = new()
             {
-                Keys = generated.Select(DebugOptionKey).Where(key => !string.IsNullOrEmpty(key)).ToList(),
-                RelicEntries = generated
-                    .Select(option => option?.Relic?.Id?.Entry ?? option?.Relic?.GetType().Name ?? "<none>")
+                Options = generated
+                    .Select(option =>
+                    {
+                        string key = DebugOptionKey(option);
+                        string relicEntry = option?.Relic?.Id?.Entry ?? option?.Relic?.GetType().Name ?? "<none>";
+                        bool hasLiveMatch = !string.IsNullOrEmpty(key) && liveKeys.Contains(key);
+
+                        return new CachedRewardOption
+                        {
+                            Key = key,
+                            RelicEntry = relicEntry,
+                            SourceKind = hasLiveMatch ? CachedRewardSourceKind.LiveVanilla : CachedRewardSourceKind.GeneratedOnly,
+                            GeneratedOption = hasLiveMatch ? null : option
+                        };
+                    })
+                    .Where(entry => !string.IsNullOrEmpty(entry.Key))
                     .ToList(),
                 Reason = reason
             };
+
+            snapshot.Keys = snapshot.Options.Select(option => option.Key).ToList();
+            snapshot.RelicEntries = snapshot.Options.Select(option => option.RelicEntry).ToList();
 
             CachedRewardKeysByNeow.Remove(neow);
             CachedRewardKeysByNeow.Add(neow, snapshot);
 
             GD.Print(
                 $"{LogPrefix} Built cached vanilla reward keys for owner={GetOwnerId(owner)} reason={reason} " +
-                $"count={snapshot.Keys.Count} keys={string.Join(",", snapshot.Keys)} relics={string.Join(",", snapshot.RelicEntries)}"
+                $"count={snapshot.Keys.Count} keys={string.Join(",", snapshot.Keys)} relics={string.Join(",", snapshot.RelicEntries)} " +
+                $"generatedOnlyKeys={string.Join(",", snapshot.Options.Where(option => option.SourceKind == CachedRewardSourceKind.GeneratedOnly).Select(option => option.Key))}"
             );
 
             return snapshot.Keys.ToList();
@@ -518,6 +588,11 @@ public static class NeowRewardHelper
                 cachedKeyCount = cached?.Keys.Count ?? 0,
                 cachedKeys = cached?.Keys.ToArray() ?? Array.Empty<string>(),
                 cachedRelics = cached?.RelicEntries.ToArray() ?? Array.Empty<string>(),
+                cachedKinds = cached?.Options.Select(option => option.SourceKind.ToString()).ToArray() ?? Array.Empty<string>(),
+                generatedOnlyKeys = cached?.Options
+                    .Where(option => option.SourceKind == CachedRewardSourceKind.GeneratedOnly)
+                    .Select(option => option.Key)
+                    .ToArray() ?? Array.Empty<string>(),
                 cacheReason = cached?.Reason ?? string.Empty,
                 initialDescription = DebugLocSafe(neow.InitialDescription)
             };
