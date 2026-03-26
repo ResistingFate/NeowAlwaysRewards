@@ -1,6 +1,6 @@
 ﻿# NeowAlwaysRewards
 
-NeowAlwaysRewards allows Neow rewards to show in Custom Mode and Daily Challenge runs, not just standard runs.
+NeowAlwaysRewards allows Neow rewards to show in Custom Mode and Daily Challenge runs, not just standard runs. (Now works for Multiplayer)
 
 <img src="NeowAlwaysRewards/NeowAlwaysRewards.gif" alt="Alt Text" width="480" />
 
@@ -13,6 +13,7 @@ In vanilla, Neow gives blessings only in standard mode. The reason is likely wit
 - Daily Runs
 - Custom Runs with no extra Neow choices
 - Custom Runs with any number of extra Neow choices
+- Multiplayer runs (Tested with teams of 2 players)
 
 ## How it works
 
@@ -67,7 +68,6 @@ Future work
 - Monitor patch order interactions with other Neow mods
 - Add explicit Harmony ordering if needed
 - Trim remaining debug logging
-- Multiplayer testing
 
 ## Build
 - I followed Alchyr's guide with JellyBeans Rider and use their templates:

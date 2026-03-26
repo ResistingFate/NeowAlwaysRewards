@@ -9,7 +9,6 @@ using Godot;
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Events;
-using MegaCrit.Sts2.Core.Extensions;
 using MegaCrit.Sts2.Core.HoverTips;
 using MegaCrit.Sts2.Core.Localization;
 using MegaCrit.Sts2.Core.Models;
@@ -38,23 +37,27 @@ public static class NeowPatch
 
     private static bool Prefix(Neow __instance, Func<Task> modifierFunc, int index, ref Task __result)
     {
-        // Replace the full modifier flow again. This keeps the remote page progression in sync,
-        // which the "last modifier only" patch failed to do in multiplayer.
+        // Replace the vanilla modifier flow so custom run modifiers still chain one-by-one,
+        // but rebuild the final blessing page from fresh live vanilla EventOptions.
+        //
+        // The key difference from the previous version is:
+        // - we do NOT reuse cached EventOption instances
+        // - we do NOT wrap cached EventOption callbacks
+        // - we only cache the final blessing TEXT KEYS early
+        // - when the last modifier finishes, we rebuild fresh live options from neow.AllPossibleOptions
+        //
+        // That keeps the page progression fix that multiplayer needed, while letting the final
+        // blessing choice run through a much more vanilla-looking callback path.
         __result = RunModifierSelectionFlow(__instance, modifierFunc, index);
         return false;
     }
 
     private static async Task RunModifierSelectionFlow(Neow neow, Func<Task> modifierFunc, int index)
     {
-        // This is the main replacement flow for modifier-backed Neow starts:
-        // 1) run the selected modifier callback,
-        // 2) move to the next modifier immediately when there is one,
-        // 3) otherwise show a reconstructed blessing page built from cached vanilla options.
-        //
-        // The important difference from the older full replacement is that the final blessing page
-        // is made of fresh wrapper EventOptions, not the exact EventOption instances cached earlier.
-        // Each wrapper delegates its OnChosen back to the original vanilla option so the reward logic
-        // still runs through the same callback path, while avoiding stale/shared EventOption instances.
+        // Main replacement flow:
+        // 1) run the chosen modifier callback,
+        // 2) show the next modifier immediately if there is one,
+        // 3) otherwise reconstruct the cached blessing page from fresh live vanilla options.
         NeowRewardHelper.LogStateJson(neow, $"OnModifierOptionSelected.enter[{index}]");
 
         await modifierFunc();
@@ -92,13 +95,13 @@ public static class NeowPatch
             return;
         }
 
-        IReadOnlyList<EventOption> rewards = NeowRewardHelper.GetOrBuildWrappedVanillaRewards(
+        IReadOnlyList<EventOption> rewards = NeowRewardHelper.GetOrBuildLiveVanillaRewardsFromCachedKeys(
             neow,
             "OnModifierOptionSelected.final"
         );
 
         GD.Print(
-            $"{LogPrefix} Last modifier completed for owner={NeowRewardHelper.GetOwnerId(neow)}. Wrapped reward count={rewards.Count}"
+            $"{LogPrefix} Last modifier completed for owner={NeowRewardHelper.GetOwnerId(neow)}. Live reward count={rewards.Count}"
         );
         LogRewardOptions(neow, rewards);
 
@@ -110,7 +113,7 @@ public static class NeowPatch
         }
 
         GD.PrintErr(
-            $"{LogPrefix} No wrapped rewards were available after modifier queue for owner={NeowRewardHelper.GetOwnerId(neow)}; finishing event."
+            $"{LogPrefix} No live rewards were available after modifier queue for owner={NeowRewardHelper.GetOwnerId(neow)}; finishing event."
         );
         FinishNeowEvent(neow);
     }
@@ -134,7 +137,7 @@ public static class NeowPatch
     private static void SetEventState(Neow neow, object description, IEnumerable<EventOption> options)
     {
         // Route the page swap through the same private method vanilla uses, but log the exact
-        // option list first so we can compare both peers around the failure point.
+        // option list first so both peers can be compared around a desync.
         List<EventOption> optionList = options?.ToList() ?? new List<EventOption>();
 
         GD.Print(
@@ -175,38 +178,35 @@ public static class NeowPatch
 
     private static void FinishNeowEvent(Neow neow)
     {
-        // Fallback finish path for the rare cases where we cannot show a blessing page at all.
+        // Finish Neow in the same general way vanilla does when there is no page to show.
         var neowTr = Traverse.Create(neow);
         string entry = GetNeowEntry(neowTr);
 
-        MethodInfo? localizationLookupMethod = AccessTools.Method(
-            neow.GetType(),
-            "L10NLookup",
-            new[] { typeof(string) }
-        );
+        object? doneDescription = InvokeL10NLookup(neow, $"{entry}.pages.DONE.description");
+        if (doneDescription is null)
+            doneDescription = GetInitialDescription(neowTr);
 
-        object doneDescription =
-            localizationLookupMethod?.Invoke(neow, new object[] { $"{entry}.pages.DONE.description" })
-            ?? GetInitialDescription(neowTr)
-            ?? string.Empty;
-
-        MethodInfo? setEventFinishedMethod = FindCompatibleSetEventFinishedMethod(neow.GetType(), doneDescription);
-        if (setEventFinishedMethod is null)
+        MethodInfo? setEventFinished = FindCompatibleSetEventFinishedMethod(neow.GetType(), doneDescription);
+        if (setEventFinished is null)
         {
             GD.PrintErr(
-                $"{LogPrefix} Could not find a compatible SetEventFinished overload for description type {doneDescription.GetType().FullName}."
+                $"{LogPrefix} Could not find a compatible SetEventFinished overload for owner={NeowRewardHelper.GetOwnerId(neow)}."
             );
             return;
         }
 
         GD.Print(
-            $"{LogPrefix} FinishNeowEvent owner={NeowRewardHelper.GetOwnerId(neow)} description={NeowRewardHelper.DebugDescription(doneDescription)}"
+            $"{LogPrefix} FinishNeowEvent owner={NeowRewardHelper.GetOwnerId(neow)} descriptionType={doneDescription?.GetType().FullName ?? "<null>"}"
         );
-        setEventFinishedMethod.Invoke(neow, new[] { doneDescription });
+
+        setEventFinished.Invoke(neow, new[] { doneDescription });
     }
 
-    private static MethodInfo? FindCompatibleSetEventFinishedMethod(Type neowType, object description)
+    private static MethodInfo? FindCompatibleSetEventFinishedMethod(Type neowType, object? description)
     {
+        if (description is null)
+            return null;
+
         return neowType
             .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
             .FirstOrDefault(method =>
@@ -215,8 +215,17 @@ public static class NeowPatch
                     return false;
 
                 ParameterInfo[] parameters = method.GetParameters();
-                return parameters.Length == 1 && parameters[0].ParameterType.IsInstanceOfType(description);
+                if (parameters.Length != 1)
+                    return false;
+
+                return parameters[0].ParameterType.IsInstanceOfType(description);
             });
+    }
+
+    private static object? InvokeL10NLookup(Neow neow, string key)
+    {
+        MethodInfo? method = AccessTools.Method(neow.GetType(), "L10NLookup", new[] { typeof(string) });
+        return method?.Invoke(neow, new object[] { key });
     }
 
     private static string GetNeowEntry(Traverse neowTr)
@@ -234,47 +243,47 @@ public static class NeowGenerateInitialOptionsCachePatch
     [HarmonyPriority(Priority.Low)]
     private static void Postfix(Neow __instance, ref IReadOnlyList<EventOption> __result)
     {
-        // Cache the vanilla blessing page early, before the modifier chain advances.
-        // This locks in the intended blessing choices without regenerating them later.
+        // Cache the final blessing KEYS early, before the modifier chain advances.
+        // This freezes the RNG result up front without reusing old EventOption instances later.
         Player? owner = Traverse.Create(__instance).Property("Owner").GetValue<Player>();
         if (owner is null)
             return;
 
         if (!NeowRewardHelper.IsBuildingRewardsIgnoringModifiers() && owner.RunState.Modifiers.Count > 0)
         {
-            IReadOnlyList<EventOption> templates = NeowRewardHelper.GetOrBuildCachedVanillaRewardTemplates(
+            IReadOnlyList<string> keys = NeowRewardHelper.GetOrBuildCachedVanillaRewardKeys(
                 __instance,
                 "GenerateInitialOptions.Postfix"
             );
 
             GD.Print(
-                $"[NeowAlwaysRewards] Cached vanilla reward templates for owner={NeowRewardHelper.GetOwnerId(owner)} count={templates.Count} " +
-                $"keys={NeowRewardHelper.DebugOptionKeys(templates)}"
+                $"[NeowAlwaysRewards] Cached vanilla reward keys for owner={NeowRewardHelper.GetOwnerId(owner)} count={keys.Count} " +
+                $"keys={string.Join(",", keys)}"
             );
         }
 
         // If a custom run had modifiers but none of them produced a Neow option, fall back to
-        // the reconstructed vanilla blessing page instead of leaving Neow empty.
+        // the live reconstructed vanilla blessing page instead of leaving Neow empty.
         if (owner.RunState.Modifiers.Count <= 0)
-            return;
+            return; // Standard runs stay unchanged
 
         if (__result.Count > 0)
-            return;
+            return; // Vanilla already produced modifier options.
 
         if (NeowRewardHelper.IsBuildingRewardsIgnoringModifiers())
             return;
 
-        IReadOnlyList<EventOption> wrappedRewards = NeowRewardHelper.GetOrBuildWrappedVanillaRewards(
+        IReadOnlyList<EventOption> liveRewards = NeowRewardHelper.GetOrBuildLiveVanillaRewardsFromCachedKeys(
             __instance,
             "GenerateInitialOptions.Fallback"
         );
 
-        if (wrappedRewards.Count > 0)
+        if (liveRewards.Count > 0)
         {
             GD.Print(
-                $"[NeowAlwaysRewards] No modifier Neow options for owner={NeowRewardHelper.GetOwnerId(owner)}; using wrapped vanilla rewards."
+                $"[NeowAlwaysRewards] No modifier Neow options for owner={NeowRewardHelper.GetOwnerId(owner)}; using live vanilla rewards."
             );
-            __result = wrappedRewards;
+            __result = liveRewards;
         }
     }
 }
@@ -342,160 +351,80 @@ public static class NeowRewardHelper
     [ThreadStatic]
     private static bool _buildingRewardsIgnoringModifiers;
 
-    private sealed class CachedVanillaRewards
+    private sealed class CachedRewardKeys
     {
-        public List<EventOption> Templates { get; init; } = new();
+        public List<string> Keys { get; init; } = new();
+        public List<string> RelicEntries { get; init; } = new();
+        public string Reason { get; init; } = string.Empty;
     }
 
-    private static readonly ConditionalWeakTable<Neow, CachedVanillaRewards> _cachedVanillaRewards = new();
+    private static readonly ConditionalWeakTable<Neow, CachedRewardKeys> CachedRewardKeysByNeow = new();
 
     public static bool IsBuildingRewardsIgnoringModifiers()
     {
         return _buildingRewardsIgnoringModifiers;
     }
 
-    public static string GetOwnerId(Neow neow)
+    /// <summary>
+    /// Build the vanilla blessing page by temporarily ignoring custom-run modifiers,
+    /// but only keep a lightweight snapshot of the chosen option keys and relic ids.
+    /// </summary>
+    public static IReadOnlyList<string> GetOrBuildCachedVanillaRewardKeys(Neow neow, string reason)
     {
-        Player? owner = Traverse.Create(neow).Property("Owner").GetValue<Player>();
-        return GetOwnerId(owner);
+        if (CachedRewardKeysByNeow.TryGetValue(neow, out CachedRewardKeys? cached))
+            return cached.Keys.ToList();
+
+        return BuildAndCacheVanillaRewardKeys(neow, reason);
     }
 
-    public static string GetOwnerId(Player? owner)
+    /// <summary>
+    /// Rebuild fresh live EventOptions from neow.AllPossibleOptions using the cached key order.
+    /// This avoids reusing stale EventOption instances and keeps the live callbacks vanilla.
+    /// </summary>
+    public static IReadOnlyList<EventOption> GetOrBuildLiveVanillaRewardsFromCachedKeys(Neow neow, string reason)
     {
-        return owner?.NetId.ToString() ?? "<null-owner>";
-    }
+        IReadOnlyList<string> keys = GetOrBuildCachedVanillaRewardKeys(neow, reason);
+        if (keys.Count <= 0)
+            return Array.Empty<EventOption>();
 
-    public static string GetEventIdSafe(EventModel? eventModel)
-    {
-        try
+        List<EventOption> allLiveOptions = neow.AllPossibleOptions?.ToList() ?? new List<EventOption>();
+        Dictionary<string, EventOption> byKey = allLiveOptions
+            .Where(option => option?.TextKey is not null)
+            .GroupBy(option => option.TextKey)
+            .ToDictionary(group => group.Key, group => group.First());
+
+        List<EventOption> rebuilt = new();
+        foreach (string key in keys)
         {
-            return eventModel?.Id?.Entry ?? "<null-event>";
-        }
-        catch
-        {
-            return eventModel?.ToString() ?? "<null-event>";
-        }
-    }
-
-    public static string DebugDescription(object? description)
-    {
-        if (description is null)
-            return "<null>";
-
-        if (description is LocString loc)
-            return DebugLocSafe(loc);
-
-        return description.ToString() ?? "<null>";
-    }
-
-    public static string DebugLocSafe(LocString? loc)
-    {
-        if (loc is null)
-            return "<null>";
-
-        try
-        {
-            return $"{loc.GetFormattedText()} (key={loc.LocTable}:{loc.LocEntryKey})";
-        }
-        catch
-        {
-            return $"<{loc.LocTable}:{loc.LocEntryKey}>";
-        }
-    }
-
-    public static string DebugOptionKey(EventOption? option)
-    {
-        if (option is null)
-            return "<null>";
-
-        if (!string.IsNullOrEmpty(option.TextKey))
-            return option.TextKey;
-
-        if (option.Title is not null)
-            return $"{option.Title.LocTable}:{option.Title.LocEntryKey}";
-
-        return "<unknown-option>";
-    }
-
-    public static string DebugOptionKeys(IEnumerable<EventOption>? options)
-    {
-        if (options is null)
-            return "<null>";
-
-        return string.Join(",", options.Select(DebugOptionKey));
-    }
-
-    public static void LogStateJson(Neow neow, string stage)
-    {
-        try
-        {
-            var neowTr = Traverse.Create(neow);
-            Player? owner = neowTr.Property("Owner").GetValue<Player>();
-            List<EventOption> modifierOptions = neowTr.Property("ModifierOptions").GetValue<List<EventOption>>() ?? new();
-
-            IReadOnlyList<EventOption> currentOptions = neow.CurrentOptions;
-            IReadOnlyList<EventOption> cachedTemplates = GetCachedVanillaRewardTemplates(neow);
-
-            var payload = new
+            if (!byKey.TryGetValue(key, out EventOption? live))
             {
-                stage,
-                owner = GetOwnerId(owner),
-                eventId = GetEventIdSafe(neow),
-                isFinished = neow.IsFinished,
-                currentOptionCount = currentOptions.Count,
-                currentOptionKeys = currentOptions.Select(DebugOptionKey).ToArray(),
-                modifierOptionCount = modifierOptions.Count,
-                modifierOptionKeys = modifierOptions.Select(DebugOptionKey).ToArray(),
-                cachedTemplateCount = cachedTemplates.Count,
-                cachedTemplateKeys = cachedTemplates.Select(DebugOptionKey).ToArray(),
-                initialDescription = DebugDescription(neowTr.Property("InitialDescription").GetValue())
-            };
+                GD.PrintErr(
+                    $"{LogPrefix} Failed to rebuild live vanilla reward for owner={GetOwnerId(neow)} key={key}. " +
+                    $"Available keys={string.Join(",", byKey.Keys.OrderBy(x => x))}"
+                );
+                continue;
+            }
 
-            GD.Print($"{LogPrefix} STATE {JsonSerializer.Serialize(payload)}");
+            AttachDebugBeforeChosen(neow, live, reason);
+            rebuilt.Add(live);
         }
-        catch (Exception ex)
-        {
-            GD.PrintErr($"{LogPrefix} Failed to log state JSON at stage={stage}: {ex}");
-        }
+
+        GD.Print(
+            $"{LogPrefix} CreateLiveVanillaRewards owner={GetOwnerId(neow)} reason={reason} count={rebuilt.Count} keys={DebugOptionKeys(rebuilt)}"
+        );
+
+        return rebuilt;
     }
 
-    public static IReadOnlyList<EventOption> GetCachedVanillaRewardTemplates(Neow neow)
+    private static IReadOnlyList<string> BuildAndCacheVanillaRewardKeys(Neow neow, string reason)
     {
-        return _cachedVanillaRewards.TryGetValue(neow, out CachedVanillaRewards? cached)
-            ? cached.Templates
-            : Array.Empty<EventOption>();
-    }
-
-    public static IReadOnlyList<EventOption> GetOrBuildCachedVanillaRewardTemplates(Neow neow, string reason)
-    {
-        if (_cachedVanillaRewards.TryGetValue(neow, out CachedVanillaRewards? cached) && cached.Templates.Count > 0)
-            return cached.Templates;
-
-        IReadOnlyList<EventOption> built = BuildVanillaRewardsIgnoringModifiers(neow);
-        CacheVanillaRewardTemplates(neow, built, reason);
-        return GetCachedVanillaRewardTemplates(neow);
-    }
-
-    public static IReadOnlyList<EventOption> GetOrBuildWrappedVanillaRewards(Neow neow, string reason)
-    {
-        IReadOnlyList<EventOption> templates = GetOrBuildCachedVanillaRewardTemplates(neow, $"{reason}.templates");
-        if (templates.Count <= 0)
-            return Array.Empty<EventOption>();
-
-        return CreateWrappedVanillaRewards(neow, templates, reason);
-    }
-
-    public static IReadOnlyList<EventOption> BuildVanillaRewardsIgnoringModifiers(Neow neow)
-    {
-        // Temporarily remove modifiers, run GenerateInitialOptions, then restore the original list.
-        // This gives us the same vanilla blessing page Neow would normally have shown in a non-custom run.
         if (_buildingRewardsIgnoringModifiers)
-            return Array.Empty<EventOption>();
+            return Array.Empty<string>();
 
         var neowTr = Traverse.Create(neow);
         Player? owner = neowTr.Property("Owner").GetValue<Player>();
         if (owner is null)
-            return Array.Empty<EventOption>();
+            return Array.Empty<string>();
 
         var runStateTr = Traverse.Create(owner.RunState);
         var modifiersProperty = runStateTr.Property("Modifiers");
@@ -506,24 +435,43 @@ public static class NeowRewardHelper
         try
         {
             _buildingRewardsIgnoringModifiers = true;
+            // Traverse can temporarily replace a property value through reflection.
             modifiersProperty.SetValue((IReadOnlyList<ModifierModel>)Array.Empty<ModifierModel>());
 
             MethodInfo? generateInitialOptionsMethod = AccessTools.Method(typeof(Neow), "GenerateInitialOptions");
             if (generateInitialOptionsMethod is null)
             {
                 GD.PrintErr($"{LogPrefix} Could not find GenerateInitialOptions.");
-                return Array.Empty<EventOption>();
+                return Array.Empty<string>();
             }
 
-            IReadOnlyList<EventOption> result =
-                generateInitialOptionsMethod.Invoke(neow, null) as IReadOnlyList<EventOption>
+            IReadOnlyList<EventOption> generated =
+                generateInitialOptionsMethod.Invoke(neow, Array.Empty<object>()) as IReadOnlyList<EventOption>
                 ?? Array.Empty<EventOption>();
 
+            CachedRewardKeys snapshot = new()
+            {
+                Keys = generated.Select(DebugOptionKey).Where(key => !string.IsNullOrEmpty(key)).ToList(),
+                RelicEntries = generated
+                    .Select(option => option?.Relic?.Id?.Entry ?? option?.Relic?.GetType().Name ?? "<none>")
+                    .ToList(),
+                Reason = reason
+            };
+
+            CachedRewardKeysByNeow.Remove(neow);
+            CachedRewardKeysByNeow.Add(neow, snapshot);
+
             GD.Print(
-                $"{LogPrefix} BuildVanillaRewardsIgnoringModifiers owner={GetOwnerId(owner)} count={result.Count} keys={DebugOptionKeys(result)}"
+                $"{LogPrefix} Built cached vanilla reward keys for owner={GetOwnerId(owner)} reason={reason} " +
+                $"count={snapshot.Keys.Count} keys={string.Join(",", snapshot.Keys)} relics={string.Join(",", snapshot.RelicEntries)}"
             );
 
-            return result;
+            return snapshot.Keys.ToList();
+        }
+        catch (Exception ex)
+        {
+            GD.PrintErr($"{LogPrefix} Failed to build cached vanilla reward keys for owner={GetOwnerId(owner)}: {ex}");
+            return Array.Empty<string>();
         }
         finally
         {
@@ -532,100 +480,127 @@ public static class NeowRewardHelper
         }
     }
 
-    private static void CacheVanillaRewardTemplates(Neow neow, IReadOnlyList<EventOption> templates, string reason)
+    private static void AttachDebugBeforeChosen(Neow neow, EventOption option, string reason)
     {
-        _cachedVanillaRewards.Remove(neow);
-        _cachedVanillaRewards.Add(
-            neow,
-            new CachedVanillaRewards
-            {
-                Templates = templates.Where(t => t is not null).ToList()
-            }
-        );
-
-        GD.Print(
-            $"{LogPrefix} CacheVanillaRewardTemplates owner={GetOwnerId(neow)} reason={reason} count={templates.Count} keys={DebugOptionKeys(templates)}"
-        );
-    }
-
-    private static IReadOnlyList<EventOption> CreateWrappedVanillaRewards(
-        Neow neow,
-        IReadOnlyList<EventOption> templates,
-        string reason
-    )
-    {
-        // Rebuild the visible blessing page as fresh wrapper EventOptions. Each wrapper forwards
-        // its choice to the original vanilla option callback, which keeps the reward logic close
-        // to vanilla while avoiding reusing the exact cached EventOption objects in the live UI state.
-        List<EventOption> wrappedRewards = new();
-
-        for (int index = 0; index < templates.Count; index++)
+        // Attach logging without changing the OnChosen callback itself.
+        option.BeforeChosen += chosen =>
         {
-            EventOption template = templates[index];
-            EventOption wrapped = BuildWrappedRewardOption(neow, template, index, reason);
-            wrappedRewards.Add(wrapped);
-        }
-
-        GD.Print(
-            $"{LogPrefix} CreateWrappedVanillaRewards owner={GetOwnerId(neow)} reason={reason} count={wrappedRewards.Count} keys={DebugOptionKeys(wrappedRewards)}"
-        );
-
-        return wrappedRewards;
+            GD.Print(
+                $"{LogPrefix} LiveReward.BeforeChosen owner={GetOwnerId(neow)} reason={reason} " +
+                $"key={DebugOptionKey(chosen)} relic={chosen.Relic?.Id?.Entry ?? chosen.Relic?.GetType().Name ?? "<none>"} " +
+                $"visibleCount={neow.CurrentOptions.Count} visibleKeys={DebugOptionKeys(neow.CurrentOptions)}"
+            );
+            LogStateJson(neow, $"LiveReward.beforeChosen[{DebugOptionKey(chosen)}]");
+            return Task.CompletedTask;
+        };
     }
 
-    private static EventOption BuildWrappedRewardOption(Neow neow, EventOption template, int index, string reason)
+    public static void LogStateJson(Neow neow, string stage)
     {
-        IReadOnlyList<IHoverTip> hoverTips = template.HoverTips?.ToArray() ?? Array.Empty<IHoverTip>();
+        try
+        {
+            var neowTr = Traverse.Create(neow);
+            List<EventOption> modifierOptions =
+                neowTr.Property("ModifierOptions").GetValue<List<EventOption>>() ?? new();
 
-        EventOption wrapped = new EventOption(
-            (EventModel)neow,
-            async () =>
+            CachedRewardKeysByNeow.TryGetValue(neow, out CachedRewardKeys? cached);
+
+            object payload = new
             {
-                GD.Print(
-                    $"{LogPrefix} WrappedReward.OnChosen owner={GetOwnerId(neow)} reason={reason} index={index} " +
-                    $"key={DebugOptionKey(template)} relic={template.Relic?.Id?.Entry ?? template.Relic?.GetType().Name ?? "<none>"}"
-                );
-                LogStateJson(neow, $"WrappedReward.beforeOriginal[{index}]");
+                stage,
+                owner = GetOwnerId(neow),
+                eventId = GetEventIdSafe(neow),
+                isFinished = neow.IsFinished,
+                currentOptionCount = neow.CurrentOptions?.Count ?? 0,
+                currentOptionKeys = neow.CurrentOptions?.Select(DebugOptionKey).ToArray() ?? Array.Empty<string>(),
+                modifierOptionCount = modifierOptions.Count,
+                modifierOptionKeys = modifierOptions.Select(DebugOptionKey).ToArray(),
+                cachedKeyCount = cached?.Keys.Count ?? 0,
+                cachedKeys = cached?.Keys.ToArray() ?? Array.Empty<string>(),
+                cachedRelics = cached?.RelicEntries.ToArray() ?? Array.Empty<string>(),
+                cacheReason = cached?.Reason ?? string.Empty,
+                initialDescription = DebugLocSafe(neow.InitialDescription)
+            };
 
-                await template.Chosen();
+            GD.Print($"{LogPrefix} STATE {JsonSerializer.Serialize(payload)}");
+        }
+        catch (Exception ex)
+        {
+            GD.PrintErr($"{LogPrefix} Failed to log Neow state JSON at stage {stage}: {ex}");
+        }
+    }
 
-                LogStateJson(neow, $"WrappedReward.afterOriginal[{index}]");
-            },
-            template.Title,
-            template.Description,
-            template.TextKey,
-            hoverTips
-        );
+    public static string GetOwnerId(Neow neow)
+    {
+        return GetOwnerId(Traverse.Create(neow).Property("Owner").GetValue<Player>());
+    }
 
-        if (template.HistoryName is not null)
-            wrapped = wrapped.WithOverridenHistoryName(template.HistoryName);
+    public static string GetOwnerId(Player? owner)
+    {
+        if (owner is null)
+            return "<null-owner>";
 
-        if (!template.ShouldSaveChoiceToHistory)
-            wrapped = wrapped.ThatWontSaveToChoiceHistory();
+        try
+        {
+            return owner.NetId.ToString();
+        }
+        catch
+        {
+            return owner.ToString() ?? "<unknown-owner>";
+        }
+    }
 
-        if (template.Relic is not null)
+    public static string GetEventIdSafe(EventModel eventModel)
+    {
+        try
+        {
+            object? id = Traverse.Create(eventModel).Property("Id").GetValue();
+            string? entry = id is null ? null : Traverse.Create(id).Property("Entry").GetValue<string>();
+            return string.IsNullOrEmpty(entry) ? eventModel.Id?.ToString() ?? "<null-event-id>" : entry;
+        }
+        catch
+        {
+            return eventModel.Id?.ToString() ?? "<null-event-id>";
+        }
+    }
+
+    public static string DebugOptionKeys(IEnumerable<EventOption>? options)
+    {
+        if (options is null)
+            return string.Empty;
+
+        return string.Join(",", options.Select(DebugOptionKey));
+    }
+
+    public static string DebugOptionKey(EventOption? option)
+    {
+        return option?.TextKey ?? option?.Title?.LocEntryKey ?? "<null-option>";
+    }
+
+    public static string DebugLocSafe(object? description)
+    {
+        if (description is null)
+            return string.Empty;
+
+        if (description is LocString loc)
         {
             try
             {
-                wrapped = wrapped.WithRelic(template.Relic);
+                return loc.GetFormattedText();
             }
-            catch (Exception ex)
+            catch
             {
-                GD.PrintErr(
-                    $"{LogPrefix} Failed to copy relic onto wrapped option for owner={GetOwnerId(neow)} key={DebugOptionKey(template)}: {ex}"
-                );
+                try
+                {
+                    return $"<{loc.LocTable}:{loc.LocEntryKey}>";
+                }
+                catch
+                {
+                    return "<loc-error>";
+                }
             }
         }
 
-        wrapped.BeforeChosen += option =>
-        {
-            GD.Print(
-                $"{LogPrefix} WrappedReward.BeforeChosen owner={GetOwnerId(neow)} reason={reason} index={index} " +
-                $"visibleCount={neow.CurrentOptions.Count} visibleKeys={DebugOptionKeys(neow.CurrentOptions)} key={DebugOptionKey(option)}"
-            );
-            return Task.CompletedTask;
-        };
-
-        return wrapped;
+        return description.ToString() ?? string.Empty;
     }
 }
