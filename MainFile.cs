@@ -16,13 +16,11 @@ public partial class MainFile : Node
     public static void Initialize()
     {
         
-        GD.Print("[NeowAlwaysRewards] Initialize called");
-        Logger.Info("NeowAlwaysRewards Initialize called");
+        // GD.Print("[NeowAlwaysRewards] Initialize called");
         
         Harmony harmony = new(ModId);
         harmony.PatchAll();
         
-        GD.Print("[NeowAlwaysRewards] Harmony patches applied");
-        Logger.Info("NeowAlwaysRewards Harmony patches applied");
+        // GD.Print("[NeowAlwaysRewards] Harmony patches applied");
     }
 }

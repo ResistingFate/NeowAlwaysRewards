@@ -4,6 +4,8 @@ NeowAlwaysRewards allows Neow rewards to show in Custom Mode and Daily Challenge
 
 <img src="NeowAlwaysRewards/NeowAlwaysRewards.gif" alt="Alt Text" width="480" />
 
+Notice how you can select Specialist > Insanity > All Stars > and Still get Neow Blessings
+
 ## What it does
 
 In vanilla, Neow gives blessings only in standard mode. The reason is likely with Custom Game's Challenge Modifiers like **Draft**, **Sealed Deck**, **Specialize**, **Insanity**, and **All Stars** as they actually count as a clickable blessing when you spawn in with Neow. With this mod, you'll get **Any** of the modifiers you picked first as rewards and then Neow will give you his usual Blessings. Mods that expand Neow's blessing are designed to appear as they normally would.

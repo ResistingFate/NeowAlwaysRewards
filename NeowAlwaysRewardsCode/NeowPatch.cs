@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Threading.Tasks;
+using SysEnv = System.Environment;
 using Godot;
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Entities.Players;
@@ -18,6 +19,53 @@ using MegaCrit.Sts2.Core.Multiplayer.Game;
 // Auto-import any unresolved relic/option namespaces Rider suggests.
 
 namespace NeowAlwaysRewards.NeowAlwaysRewardsCode;
+
+
+public enum LogLevel
+{
+    Error = 0,
+    Warn = 1,
+    Info = 2,
+    Debug = 3,
+    Trace = 4
+}
+
+internal static class ModLog
+{
+    private const string Prefix = "[NeowAlwaysRewards]";
+
+    public static LogLevel CurrentLevel { get; private set; } = LogLevel.Info;
+
+    static ModLog()
+    {
+        string? rawLevel = SysEnv.GetEnvironmentVariable("NEOWALWAYSREWARDS_LOG_LEVEL");
+        if (!string.IsNullOrWhiteSpace(rawLevel) && Enum.TryParse(rawLevel, true, out LogLevel parsed))
+            CurrentLevel = parsed;
+    }
+
+    public static void SetLevel(LogLevel level) => CurrentLevel = level;
+
+    public static bool IsDebugEnabled => CurrentLevel >= LogLevel.Debug;
+    public static bool IsTraceEnabled => CurrentLevel >= LogLevel.Trace;
+
+    public static void Error(string message) => Write(LogLevel.Error, message, isError: true);
+    public static void Warn(string message) => Write(LogLevel.Warn, message);
+    public static void Info(string message) => Write(LogLevel.Info, message);
+    public static void Debug(string message) => Write(LogLevel.Debug, message);
+    public static void Trace(string message) => Write(LogLevel.Trace, message);
+
+    private static void Write(LogLevel level, string message, bool isError = false)
+    {
+        if (level > CurrentLevel)
+            return;
+
+        string line = $"{Prefix} [{level}] {message}";
+        if (isError)
+            GD.PrintErr(line);
+        else
+            GD.Print(line);
+    }
+}
 
 [HarmonyPatch]
 public static class NeowPatch
@@ -71,7 +119,7 @@ public static class NeowPatch
         object? initialDescription = GetInitialDescription(neowTr);
         if (initialDescription is null)
         {
-            GD.PrintErr($"{LogPrefix} InitialDescription was null for owner={NeowRewardHelper.GetOwnerId(neow)}.");
+            ModLog.Error($"[Neow/Flow] InitialDescription was null for owner={NeowRewardHelper.GetOwnerId(neow)}.");
             FinishNeowEvent(neow);
             return;
         }
@@ -79,16 +127,16 @@ public static class NeowPatch
         List<EventOption> modifierOptions =
             neowTr.Property("ModifierOptions").GetValue<List<EventOption>>() ?? new();
 
-        GD.Print(
-            $"{LogPrefix} OnModifierOptionSelected finished. owner={NeowRewardHelper.GetOwnerId(neow)}, index={index}, modifierOptions.Count={modifierOptions.Count}"
+        ModLog.Debug(
+            $"[Neow/Flow] Modifier selected for owner={NeowRewardHelper.GetOwnerId(neow)} index={index} modifierCount={modifierOptions.Count}"
         );
 
         if (index + 1 < modifierOptions.Count)
         {
             EventOption nextModifier = modifierOptions[index + 1];
 
-            GD.Print(
-                $"{LogPrefix} Showing next modifier option for owner={NeowRewardHelper.GetOwnerId(neow)}. nextKey={NeowRewardHelper.DebugOptionKey(nextModifier)}"
+            ModLog.Debug(
+                $"[Neow/Flow] Showing next modifier for owner={NeowRewardHelper.GetOwnerId(neow)} nextKey={NeowRewardHelper.DebugOptionKey(nextModifier)}"
             );
 
             SetEventState(neow, initialDescription, new[] { nextModifier });
@@ -101,8 +149,8 @@ public static class NeowPatch
             "OnModifierOptionSelected.final"
         );
 
-        GD.Print(
-            $"{LogPrefix} Last modifier completed for owner={NeowRewardHelper.GetOwnerId(neow)}. Live reward count={rewards.Count}"
+        ModLog.Debug(
+            $"[Neow/Flow] Final modifier completed for owner={NeowRewardHelper.GetOwnerId(neow)} liveRewardCount={rewards.Count}"
         );
         LogRewardOptions(neow, rewards);
 
@@ -113,8 +161,8 @@ public static class NeowPatch
             return;
         }
 
-        GD.PrintErr(
-            $"{LogPrefix} No live rewards were available after modifier queue for owner={NeowRewardHelper.GetOwnerId(neow)}; finishing event."
+        ModLog.Warn(
+            $"[Neow/Flow] No live rewards were available after modifier queue for owner={NeowRewardHelper.GetOwnerId(neow)}; finishing event."
         );
         FinishNeowEvent(neow);
     }
@@ -126,11 +174,14 @@ public static class NeowPatch
 
     private static void LogRewardOptions(Neow neow, IEnumerable<EventOption> rewards)
     {
+        if (!ModLog.IsTraceEnabled)
+            return;
+
         foreach (EventOption? option in rewards)
         {
-            GD.Print(
-                $"{LogPrefix} Reward option for owner={NeowRewardHelper.GetOwnerId(neow)}: {option?.Title?.GetFormattedText() ?? "<null>"} " +
-                $"(textKey={NeowRewardHelper.DebugOptionKey(option)}, relic={option?.Relic?.Id?.Entry ?? option?.Relic?.GetType().Name ?? "<none>"})"
+            ModLog.Trace(
+                $"[Neow/Rewards] option owner={NeowRewardHelper.GetOwnerId(neow)} title={option?.Title?.GetFormattedText() ?? "<null>"} " +
+                $"textKey={NeowRewardHelper.DebugOptionKey(option)} relic={option?.Relic?.Id?.Entry ?? option?.Relic?.GetType().Name ?? "<none>"}"
             );
         }
     }
@@ -141,17 +192,21 @@ public static class NeowPatch
         // option list first so both peers can be compared around a desync.
         List<EventOption> optionList = options?.ToList() ?? new List<EventOption>();
 
-        GD.Print(
-            $"{LogPrefix} SetEventState owner={NeowRewardHelper.GetOwnerId(neow)} " +
-            $"descriptionType={description.GetType().FullName} optionCount={optionList.Count} " +
-            $"optionKeys={NeowRewardHelper.DebugOptionKeys(optionList)}"
+        ModLog.Debug(
+            $"[Neow/State] owner={NeowRewardHelper.GetOwnerId(neow)} descriptionType={description.GetType().FullName} optionCount={optionList.Count}"
         );
+        if (ModLog.IsTraceEnabled)
+        {
+            ModLog.Trace(
+                $"[Neow/State] owner={NeowRewardHelper.GetOwnerId(neow)} optionKeys={NeowRewardHelper.DebugOptionKeys(optionList)}"
+            );
+        }
 
         MethodInfo? setEventState = FindCompatibleSetEventStateMethod(neow.GetType(), description);
         if (setEventState is null)
         {
-            GD.PrintErr(
-                $"{LogPrefix} Could not find a compatible SetEventState overload for description type {description.GetType().FullName}."
+            ModLog.Error(
+                $"[Neow/State] Could not find a compatible SetEventState overload for description type {description.GetType().FullName}."
             );
             return;
         }
@@ -190,14 +245,14 @@ public static class NeowPatch
         MethodInfo? setEventFinished = FindCompatibleSetEventFinishedMethod(neow.GetType(), doneDescription);
         if (setEventFinished is null)
         {
-            GD.PrintErr(
-                $"{LogPrefix} Could not find a compatible SetEventFinished overload for owner={NeowRewardHelper.GetOwnerId(neow)}."
+            ModLog.Error(
+                $"[Neow/State] Could not find a compatible SetEventFinished overload for owner={NeowRewardHelper.GetOwnerId(neow)}."
             );
             return;
         }
 
-        GD.Print(
-            $"{LogPrefix} FinishNeowEvent owner={NeowRewardHelper.GetOwnerId(neow)} descriptionType={doneDescription?.GetType().FullName ?? "<null>"}"
+        ModLog.Debug(
+            $"[Neow/Flow] FinishNeowEvent owner={NeowRewardHelper.GetOwnerId(neow)} descriptionType={doneDescription?.GetType().FullName ?? "<null>"}"
         );
 
         setEventFinished.Invoke(neow, new[] { doneDescription });
@@ -258,10 +313,15 @@ public static class NeowGenerateInitialOptionsCachePatch
                 "GenerateInitialOptions.Postfix"
             );
 
-            GD.Print(
-                $"[NeowAlwaysRewards] Cached vanilla reward keys for owner={NeowRewardHelper.GetOwnerId(owner)} count={keys.Count} " +
-                $"keys={string.Join(",", keys)}"
+            ModLog.Debug(
+                $"[Neow/Cache] Cached reward keys for owner={NeowRewardHelper.GetOwnerId(owner)} count={keys.Count}"
             );
+            if (ModLog.IsTraceEnabled)
+            {
+                ModLog.Trace(
+                    $"[Neow/Cache] owner={NeowRewardHelper.GetOwnerId(owner)} keys={string.Join(",", keys)}"
+                );
+            }
         }
 
         // If a custom run had modifiers but none of them produced a Neow option, fall back to
@@ -282,8 +342,8 @@ public static class NeowGenerateInitialOptionsCachePatch
 
         if (liveRewards.Count > 0)
         {
-            GD.Print(
-                $"[NeowAlwaysRewards] No modifier Neow options for owner={NeowRewardHelper.GetOwnerId(owner)}; using live vanilla rewards."
+            ModLog.Info(
+                $"[Neow/Fallback] No modifier Neow options for owner={NeowRewardHelper.GetOwnerId(owner)}; using live vanilla rewards."
             );
             __result = liveRewards;
         }
@@ -312,16 +372,22 @@ public static class EventSynchronizerChooseOptionForEventLogPatch
             EventModel eventForPlayer = __instance.GetEventForPlayer(player);
             IReadOnlyList<EventOption> currentOptions = eventForPlayer.CurrentOptions;
 
-            GD.Print(
-                $"{LogPrefix} [EventSynchronizer.beforeChoose] player={NeowRewardHelper.GetOwnerId(player)} " +
+            ModLog.Debug(
+                $"[Neow/EventSync.beforeChoose] player={NeowRewardHelper.GetOwnerId(player)} " +
                 $"event={NeowRewardHelper.GetEventIdSafe(eventForPlayer)} finished={eventForPlayer.IsFinished} " +
-                $"requestedIndex={optionIndex} currentCount={currentOptions.Count} " +
-                $"currentKeys={NeowRewardHelper.DebugOptionKeys(currentOptions)}"
+                $"requestedIndex={optionIndex} currentCount={currentOptions.Count}"
             );
+            if (ModLog.IsTraceEnabled)
+            {
+                ModLog.Trace(
+                    $"[Neow/EventSync.beforeChoose] player={NeowRewardHelper.GetOwnerId(player)} " +
+                    $"event={NeowRewardHelper.GetEventIdSafe(eventForPlayer)} currentKeys={NeowRewardHelper.DebugOptionKeys(currentOptions)}"
+                );
+            }
         }
         catch (Exception ex)
         {
-            GD.PrintErr($"{LogPrefix} [EventSynchronizer.beforeChoose] logging failed: {ex}");
+            ModLog.Error($"[Neow/EventSync.beforeChoose] logging failed: {ex}");
         }
     }
 
@@ -332,16 +398,22 @@ public static class EventSynchronizerChooseOptionForEventLogPatch
             EventModel eventForPlayer = __instance.GetEventForPlayer(player);
             IReadOnlyList<EventOption> currentOptions = eventForPlayer.CurrentOptions;
 
-            GD.Print(
-                $"{LogPrefix} [EventSynchronizer.afterChoose] player={NeowRewardHelper.GetOwnerId(player)} " +
+            ModLog.Debug(
+                $"[Neow/EventSync.afterChoose] player={NeowRewardHelper.GetOwnerId(player)} " +
                 $"event={NeowRewardHelper.GetEventIdSafe(eventForPlayer)} finished={eventForPlayer.IsFinished} " +
-                $"chosenIndex={optionIndex} currentCount={currentOptions.Count} " +
-                $"currentKeys={NeowRewardHelper.DebugOptionKeys(currentOptions)}"
+                $"chosenIndex={optionIndex} currentCount={currentOptions.Count}"
             );
+            if (ModLog.IsTraceEnabled)
+            {
+                ModLog.Trace(
+                    $"[Neow/EventSync.afterChoose] player={NeowRewardHelper.GetOwnerId(player)} " +
+                    $"event={NeowRewardHelper.GetEventIdSafe(eventForPlayer)} currentKeys={NeowRewardHelper.DebugOptionKeys(currentOptions)}"
+                );
+            }
         }
         catch (Exception ex)
         {
-            GD.PrintErr($"{LogPrefix} [EventSynchronizer.afterChoose] logging failed: {ex}");
+            ModLog.Error($"[Neow/EventSync.afterChoose] logging failed: {ex}");
         }
     }
 }
@@ -428,8 +500,8 @@ public static class NeowRewardHelper
 
             if (cached.GeneratedOption is not null)
             {
-                GD.Print(
-                    $"{LogPrefix} Using cached generated reward fallback for owner={GetOwnerId(neow)} reason={reason} " +
+                ModLog.Debug(
+                    $"[Neow/Rewards] Using cached generated reward fallback for owner={GetOwnerId(neow)} reason={reason} " +
                     $"key={cached.Key} relic={cached.RelicEntry}"
                 );
 
@@ -438,15 +510,26 @@ public static class NeowRewardHelper
                 continue;
             }
 
-            GD.PrintErr(
-                $"{LogPrefix} Failed to rebuild reward for owner={GetOwnerId(neow)} key={cached.Key}. " +
-                $"Available live keys={string.Join(",", byKey.Keys.OrderBy(x => x))}"
+            ModLog.Warn(
+                $"[Neow/Rewards] Failed to rebuild reward for owner={GetOwnerId(neow)} key={cached.Key}."
             );
+            if (ModLog.IsTraceEnabled)
+            {
+                ModLog.Trace(
+                    $"[Neow/Rewards] owner={GetOwnerId(neow)} availableLiveKeys={string.Join(",", byKey.Keys.OrderBy(x => x))}"
+                );
+            }
         }
 
-        GD.Print(
-            $"{LogPrefix} CreateLiveVanillaRewards owner={GetOwnerId(neow)} reason={reason} count={rebuilt.Count} keys={DebugOptionKeys(rebuilt)}"
+        ModLog.Debug(
+            $"[Neow/Rewards] CreateLiveVanillaRewards owner={GetOwnerId(neow)} reason={reason} count={rebuilt.Count}"
         );
+        if (ModLog.IsTraceEnabled)
+        {
+            ModLog.Trace(
+                $"[Neow/Rewards] owner={GetOwnerId(neow)} rebuiltKeys={DebugOptionKeys(rebuilt)}"
+            );
+        }
 
         return rebuilt;
     }
@@ -489,7 +572,7 @@ public static class NeowRewardHelper
             MethodInfo? generateInitialOptionsMethod = AccessTools.Method(typeof(Neow), "GenerateInitialOptions");
             if (generateInitialOptionsMethod is null)
             {
-                GD.PrintErr($"{LogPrefix} Could not find GenerateInitialOptions.");
+                ModLog.Error("[Neow/Cache] Could not find GenerateInitialOptions.");
                 return Array.Empty<string>();
             }
 
@@ -530,17 +613,22 @@ public static class NeowRewardHelper
             CachedRewardKeysByNeow.Remove(neow);
             CachedRewardKeysByNeow.Add(neow, snapshot);
 
-            GD.Print(
-                $"{LogPrefix} Built cached vanilla reward keys for owner={GetOwnerId(owner)} reason={reason} " +
-                $"count={snapshot.Keys.Count} keys={string.Join(",", snapshot.Keys)} relics={string.Join(",", snapshot.RelicEntries)} " +
-                $"generatedOnlyKeys={string.Join(",", snapshot.Options.Where(option => option.SourceKind == CachedRewardSourceKind.GeneratedOnly).Select(option => option.Key))}"
+            ModLog.Debug(
+                $"[Neow/Cache] Built cached reward snapshot for owner={GetOwnerId(owner)} reason={reason} count={snapshot.Keys.Count}"
             );
+            if (ModLog.IsTraceEnabled)
+            {
+                ModLog.Trace(
+                    $"[Neow/Cache] owner={GetOwnerId(owner)} keys={string.Join(",", snapshot.Keys)} relics={string.Join(",", snapshot.RelicEntries)} " +
+                    $"generatedOnlyKeys={string.Join(",", snapshot.Options.Where(option => option.SourceKind == CachedRewardSourceKind.GeneratedOnly).Select(option => option.Key))}"
+                );
+            }
 
             return snapshot.Keys.ToList();
         }
         catch (Exception ex)
         {
-            GD.PrintErr($"{LogPrefix} Failed to build cached vanilla reward keys for owner={GetOwnerId(owner)}: {ex}");
+            ModLog.Error($"[Neow/Cache] Failed to build cached vanilla reward keys for owner={GetOwnerId(owner)}: {ex}");
             return Array.Empty<string>();
         }
         finally
@@ -555,11 +643,17 @@ public static class NeowRewardHelper
         // Attach logging without changing the OnChosen callback itself.
         option.BeforeChosen += chosen =>
         {
-            GD.Print(
-                $"{LogPrefix} LiveReward.BeforeChosen owner={GetOwnerId(neow)} reason={reason} " +
+            ModLog.Debug(
+                $"[Neow/Rewards] LiveReward.BeforeChosen owner={GetOwnerId(neow)} reason={reason} " +
                 $"key={DebugOptionKey(chosen)} relic={chosen.Relic?.Id?.Entry ?? chosen.Relic?.GetType().Name ?? "<none>"} " +
-                $"visibleCount={neow.CurrentOptions.Count} visibleKeys={DebugOptionKeys(neow.CurrentOptions)}"
+                $"visibleCount={neow.CurrentOptions.Count}"
             );
+            if (ModLog.IsTraceEnabled)
+            {
+                ModLog.Trace(
+                    $"[Neow/Rewards] owner={GetOwnerId(neow)} visibleKeys={DebugOptionKeys(neow.CurrentOptions)}"
+                );
+            }
             LogStateJson(neow, $"LiveReward.beforeChosen[{DebugOptionKey(chosen)}]");
             return Task.CompletedTask;
         };
@@ -567,6 +661,9 @@ public static class NeowRewardHelper
 
     public static void LogStateJson(Neow neow, string stage)
     {
+        if (!ModLog.IsTraceEnabled)
+            return;
+
         try
         {
             var neowTr = Traverse.Create(neow);
@@ -597,11 +694,11 @@ public static class NeowRewardHelper
                 initialDescription = DebugLocSafe(neow.InitialDescription)
             };
 
-            GD.Print($"{LogPrefix} STATE {JsonSerializer.Serialize(payload)}");
+            ModLog.Trace($"[Neow/StateJson] {JsonSerializer.Serialize(payload)}");
         }
         catch (Exception ex)
         {
-            GD.PrintErr($"{LogPrefix} Failed to log Neow state JSON at stage {stage}: {ex}");
+            ModLog.Error($"[Neow/StateJson] Failed to log Neow state JSON at stage {stage}: {ex}");
         }
     }
 
@@ -654,6 +751,12 @@ public static class NeowRewardHelper
 
     public static string DebugLocSafe(object? description)
     {
+        // Keep localization logging side-effect free.
+        //
+        // Calling LocString.GetFormattedText() during debug dumps can trigger BaseLib
+        // missing-key warnings for internal event descriptions such as NEOW.EVENT.description.
+        // For release-safe diagnostics, prefer the stable localization identity over
+        // resolving the actual text at log time.
         if (description is null)
             return string.Empty;
 
@@ -661,18 +764,13 @@ public static class NeowRewardHelper
         {
             try
             {
-                return loc.GetFormattedText();
+                string table = string.IsNullOrWhiteSpace(loc.LocTable) ? "<null-table>" : loc.LocTable;
+                string key = string.IsNullOrWhiteSpace(loc.LocEntryKey) ? "<null-key>" : loc.LocEntryKey;
+                return $"{table}.{key}";
             }
             catch
             {
-                try
-                {
-                    return $"<{loc.LocTable}:{loc.LocEntryKey}>";
-                }
-                catch
-                {
-                    return "<loc-error>";
-                }
+                return "<loc-error>";
             }
         }
 

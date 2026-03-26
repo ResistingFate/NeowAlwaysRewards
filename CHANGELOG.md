@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.1.2] - 2025-03-26
+
+### Changed
+- Added LogLevel and ModLog.
+- Default log level is Info.
+- Reads NEOWALWAYSREWARDS_LOG_LEVEL from the environment, supporting Error, Warn, Info, Debug, or Trace.
+- Kept the deep debugging code, but gated it:
+  - Error for real failures/exceptions
+  - Warn for suspicious fallbacks
+  - Info for notable non-error behavior
+  - Debug for normal multiplayer flow inspection
+  - Trace for JSON state dumps and verbose reward-option dumps
+- LogStateJson(...) now returns early unless Trace is enabled.
+- LogRewardOptions(...) now returns early unless Trace is enabled.
+
+### How to use it later:
+
+- normal release: leave it alone, defaults to Info
+- bug hunting: set NEOWALWAYSREWARDS_LOG_LEVEL=Debug
+- deep desync work: set NEOWALWAYSREWARDS_LOG_LEVEL=Trace
+
 ## [1.1.1] - 2026-03-26
 
 ### Fixed
