@@ -12,9 +12,11 @@ using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Events;
 using MegaCrit.Sts2.Core.HoverTips;
 using MegaCrit.Sts2.Core.Localization;
+using MegaCrit.Sts2.Core.Logging;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Models.Events;
 using MegaCrit.Sts2.Core.Multiplayer.Game;
+using Logger = MegaCrit.Sts2.Core.Logging.Logger;
 
 // Auto-import any unresolved relic/option namespaces Rider suggests.
 
@@ -48,12 +50,20 @@ internal static class ModLog
     public static bool IsDebugEnabled => CurrentLevel >= LogLevel.Debug;
     public static bool IsTraceEnabled => CurrentLevel >= LogLevel.Trace;
 
-    public static void Error(string message) => Write(LogLevel.Error, message, isError: true);
-    public static void Warn(string message) => Write(LogLevel.Warn, message);
-    public static void Info(string message) => Write(LogLevel.Info, message);
-    public static void Debug(string message) => Write(LogLevel.Debug, message);
-    public static void Trace(string message) => Write(LogLevel.Trace, message);
+    //public static void Error(string message) => Write(LogLevel.Error, message, isError: true);
+    //public static void Warn(string message) => Write(LogLevel.Warn, message);
+    //public static void Info(string message) => Write(LogLevel.Info, message);
+    //public static void Debug(string message) => Write(LogLevel.Debug, message);
+    //public static void Trace(string message) => Write(LogLevel.Trace, message);
 
+    /* Trying out Megacrit's Logger */
+    private static readonly Logger _logger = new Logger("NeowAlwaysRewards", LogType.Generic);
+    public static void Error(string message) => _logger.Error(message);
+    public static void Warn(string message) => _logger.Warn(message);
+    public static void Info(string message) => _logger.Info(message);
+    public static void Debug(string message) => _logger.Debug(message);
+    public static void Trace(string message) => _logger.VeryDebug(message);
+    
     private static void Write(LogLevel level, string message, bool isError = false)
     {
         if (level > CurrentLevel)
