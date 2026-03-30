@@ -69,7 +69,6 @@ Slay the Spire 2/
 Future work
 - Monitor patch order interactions with other Neow mods
 - Add explicit Harmony ordering if needed
-- Trim remaining debug logging
 
 ## Build
 - I followed Alchyr's guide with JellyBeans Rider and use their templates:

@@ -70,6 +70,7 @@
         <Compile Remove="**/*.uid" />
         <None Remove="**/*.uid" />
         <AdditionalFiles Remove="**/*.uid" />
+        <Compile Remove="mod_page_resources\**" />
     </ItemGroup>
     
     <ItemGroup Condition="Exists('$(Sts2DataDir)')">
@@ -99,6 +100,7 @@
         <EmbeddedResource Remove="materials/**"/>
         <EmbeddedResource Remove="shaders/**"/>
         <EmbeddedResource Remove="images/**"/>
+        <EmbeddedResource Remove="mod_page_resources\**" />
     </ItemGroup>
 
     <ItemGroup>
