@@ -36,7 +36,7 @@ public enum LogLevel
 internal static class ModLog
 {
     private const string Prefix = "[NeowAlwaysRewards]";
-    private const string ConfigFileName = "NeowAlwaysRewards.logconfig.json";
+    private const string ConfigFileName = "NeowAlwaysRewards.logconfig.cfg";
 
     public static LogLevel CurrentLevel { get; private set; } = LogLevel.Info;
 
