@@ -1,3 +1,4 @@
+using Godot;
 using System.Collections.Generic;
 using System.Linq;
 using MegaCrit.Sts2.Core.Events;
@@ -39,6 +40,48 @@ internal static class NeowLocaleDiagnostics
             $"relic={option?.Relic?.Id?.Entry ?? option?.Relic?.GetType().Name ?? "<none>"}";
     }
 
+    public static string GetGameLocaleSafe()
+    {
+        // Read the currently active Godot translation locale without letting diagnostics throw.
+        try
+        {
+            return TranslationServer.GetLocale();
+        }
+        catch
+        {
+            return "<game-locale-error>";
+        }
+    }
+
+    public static string GetOsLocaleSafe()
+    {
+        // Read the OS locale separately so reward logs can show whether the game changed locale independently.
+        try
+        {
+            return OS.GetLocale();
+        }
+        catch
+        {
+            return "<os-locale-error>";
+        }
+    }
+
+    public static bool IsSuspectedIssueLocale()
+    {
+        // Identify whether the runtime appears to be in the locale family reported by the original issue giver.
+        string gameLocale = GetGameLocaleSafe();
+        return gameLocale.StartsWith("zh", System.StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static void LogRuntimeLocale(string category)
+    {
+        // Emit a trace-level snapshot of the active runtime locales near reward cache and rebuild work.
+        if (!ModLog.IsTraceEnabled)
+            return;
+
+        ModLog.Trace($"[{category}] gameLocale={GetGameLocaleSafe()} osLocale={GetOsLocaleSafe()}");
+    }
+
     public static void LogOption(string category, EventOption? option)
     {
         // Emit a single trace-level diagnostic line for one option identity.
@@ -55,9 +98,7 @@ internal static class NeowLocaleDiagnostics
             return;
 
         foreach (EventOption? option in options)
-        {
             LogOption(category, option);
-        }
     }
 
     public static void LogDuplicateIdentities(string category, IEnumerable<EventOption>? options)
@@ -77,9 +118,7 @@ internal static class NeowLocaleDiagnostics
             ModLog.Trace($"[{category}] identity={group.Key} count={group.Count()}");
 
             foreach (EventOption option in group)
-            {
                 LogOption($"{category}.member", option);
-            }
         }
     }
 }

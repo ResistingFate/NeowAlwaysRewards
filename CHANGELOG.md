@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-04-01
+
+### Fixed
+- Fixed an issue where Neow blessings could fail to appear in Custom runs on other languages.
+- Improved Neow reward reconstruction after modifier selection.
+- Fixed reward cache snapshot data not being populated correctly.
+- Improved matching between cached rewards and live Neow options.
+- Preserved generated-only modded Neow rewards more reliably.
+- Added much more detailed diagnostic logging for Neow reward flow, cache rebuilding, locale state, and event sync.
+- Reverted logging from the Game's version to the mod's logger.
+
 ## [1.1.2] - 2026-03-26
 
 ### Changed
