@@ -386,9 +386,10 @@ public static class NeowPatch
 }
 
 [HarmonyPatch(typeof(Neow), "GenerateInitialOptions")]
+[HarmonyAfter("ABStS2Mod")]
 public static class NeowGenerateInitialOptionsCachePatch
 {
-    [HarmonyPriority(Priority.Low)]
+    [HarmonyPriority(Priority.Last)]
     private static void Postfix(Neow __instance, ref IReadOnlyList<EventOption> __result)
     {
         // Cache the final blessing result early, before the modifier chain advances.
@@ -400,6 +401,11 @@ public static class NeowGenerateInitialOptionsCachePatch
 
         if (!NeowRewardHelper.IsBuildingRewardsIgnoringModifiers() && owner.RunState.Modifiers.Count > 0)
         {
+            // ABStS2Mod compatibility:
+            // When custom-run modifiers are present, ABStS2Mod's real GenerateInitialOptions postfix
+            // intentionally returns early. The synthetic no-modifier probe inside
+            // GetOrBuildCachedVanillaRewardKeys() is therefore the place where ABStS's
+            // pre-Neow difficulty page can still be generated and cached as generated-only options.
             IReadOnlyList<string> keys = NeowRewardHelper.GetOrBuildCachedVanillaRewardKeys(
                 __instance,
                 "GenerateInitialOptions.Postfix"
@@ -904,6 +910,12 @@ snapshot.RelicEntries = snapshot.Options.Select(option => option.RelicEntry).ToL
                     $"[Neow/Cache] owner={GetOwnerId(owner)} keys={string.Join(",", snapshot.Keys)} relics={string.Join(",", snapshot.RelicEntries)} " +
                     $"generatedOnlyKeys={string.Join(",", snapshot.Options.Where(option => option.SourceKind == CachedRewardSourceKind.GeneratedOnly).Select(option => option.Key))}"
                 );
+                if (snapshot.Options.Any(option => option.SourceKind == CachedRewardSourceKind.GeneratedOnly))
+                {
+                    ModLog.Trace(
+                        $"[Neow/Cache] owner={GetOwnerId(owner)} preserving generated-only options for final-page fallback."
+                    );
+                }
                 ModLog.Trace(
                     $"[Neow/Cache] owner={GetOwnerId(owner)} debugKeys={string.Join(",", snapshot.DebugKeys)}"
                 );
