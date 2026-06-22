@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -17,6 +17,7 @@ using MegaCrit.Sts2.Core.Logging;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Models.Events;
 using MegaCrit.Sts2.Core.Multiplayer.Game;
+using MegaCrit.Sts2.Core.Random;
 using Logger = MegaCrit.Sts2.Core.Logging.Logger;
 
 // Auto-import any unresolved relic/option namespaces Rider suggests.
@@ -38,7 +39,7 @@ internal static class ModLog
     private const string Prefix = "[NeowAlwaysRewards]";
     private const string ConfigFileName = "NeowAlwaysRewards.logconfig.cfg";
 
-    public static LogLevel CurrentLevel { get; private set; } = LogLevel.Trace;
+    public static LogLevel CurrentLevel { get; private set; } = LogLevel.Debug;
     public static string CurrentLevelSource { get; private set; } = "default";
 
     private sealed class LogConfigFile
@@ -166,100 +167,123 @@ public static class NeowPatch
         )!;
     }
 
+    [HarmonyPriority(Priority.Low)]
     private static bool Prefix(Neow __instance, Func<Task> modifierFunc, int index, ref Task __result)
     {
-        // Replace the vanilla modifier flow so custom run modifiers still chain one-by-one,
-        // but rebuild the final blessing page from fresh live vanilla EventOptions where possible.
+        // Only replace the FINAL modifier hop.
         //
-        // The key difference from the previous version is:
-        // - we do NOT reuse cached vanilla EventOption instances
-        // - we do NOT wrap cached EventOption callbacks
-        // - we cache the final blessing TEXT KEYS early, plus any generated-only third-party options
-        // - when the last modifier finishes, we rebuild fresh live options from neow.AllPossibleOptions
-        //   and only fall back to the cached generated option when no live vanilla option exists
+        // Let vanilla handle intermediate modifier pages so other mods that expect the
+        // normal one-by-one modifier flow keep seeing the original method behavior.
         //
-        // That keeps the page progression fix that multiplayer needed, while letting the final
-        // blessing choice run through a much more vanilla-looking callback path.
-        __result = RunModifierSelectionFlow(__instance, modifierFunc, index);
+        // On the last modifier, avoid finishing Neow immediately. Instead:
+        // 1) run the chosen modifier callback,
+        // 2) preserve any non-modifier options another mod already placed on the event,
+        // 3) merge in the cached vanilla blessing page as a fallback/addition.
+        List<EventOption> modifierOptions =
+            Traverse.Create(__instance).Property("ModifierOptions").GetValue<List<EventOption>>() ?? new();
+
+        if (index + 1 < modifierOptions.Count)
+            return true;
+
+        if (!NeowRewardHelper.HasUsableCachedVanillaRewardFallback(__instance))
+        {
+            ModLog.Debug(
+                $"[Neow/Flow] No cached vanilla fallback was available for owner={NeowRewardHelper.GetOwnerId(__instance)}; using vanilla final modifier flow."
+            );
+            return true;
+        }
+
+        __result = RunFinalModifierSelectionFlow(__instance, modifierFunc, index);
         return false;
     }
 
-    private static async Task RunModifierSelectionFlow(Neow neow, Func<Task> modifierFunc, int index)
+    private static async Task RunFinalModifierSelectionFlow(Neow neow, Func<Task> modifierFunc, int index)
     {
-        // Main replacement flow:
-        // 1) run the chosen modifier callback,
-        // 2) show the next modifier immediately if there is one,
-        // 3) otherwise reconstruct the cached blessing page from fresh live vanilla options.
-        NeowRewardHelper.LogStateJson(neow, $"OnModifierOptionSelected.enter[{index}]");
-
-        await modifierFunc();
-
-        NeowRewardHelper.LogStateJson(neow, $"OnModifierOptionSelected.afterModifierFunc[{index}]");
-
-        var neowTr = Traverse.Create(neow);
-
-        // Read as object because the description is not guaranteed to be a plain string.
-        object? initialDescription = GetInitialDescription(neowTr);
-        if (initialDescription is null)
+        try
         {
-            ModLog.Error($"[Neow/Flow] InitialDescription was null for owner={NeowRewardHelper.GetOwnerId(neow)}.");
-            FinishNeowEvent(neow);
-            return;
-        }
+            // Compatibility-first final modifier flow:
+            // - keep the real modifier callback intact,
+            // - preserve any live non-modifier page another mod produced,
+            // - only synthesize vanilla blessings when there is no better live page.
+            NeowRewardHelper.LogStateJson(neow, $"OnModifierOptionSelected.final.enter[{index}]");
 
-        List<EventOption> modifierOptions =
-            neowTr.Property("ModifierOptions").GetValue<List<EventOption>>() ?? new();
+            await modifierFunc();
 
-        ModLog.Debug(
-            $"[Neow/Flow] Modifier selected for owner={NeowRewardHelper.GetOwnerId(neow)} index={index} modifierCount={modifierOptions.Count}"
-        );
+            NeowRewardHelper.LogStateJson(neow, $"OnModifierOptionSelected.final.afterModifierFunc[{index}]");
 
-        if (index + 1 < modifierOptions.Count)
-        {
-            EventOption nextModifier = modifierOptions[index + 1];
+            var neowTr = Traverse.Create(neow);
 
-            ModLog.Debug(
-                $"[Neow/Flow] Showing next modifier for owner={NeowRewardHelper.GetOwnerId(neow)} nextKey={NeowRewardHelper.DebugOptionKey(nextModifier)}"
+            object? rewardPageDescription = GetRewardPageDescription(neow, neowTr);
+            if (rewardPageDescription is null)
+            {
+                ModLog.Error($"[Neow/Flow] Reward page description was null for owner={NeowRewardHelper.GetOwnerId(neow)}.");
+                FinishNeowEvent(neow);
+                return;
+            }
+
+            List<EventOption> modifierOptions =
+                neowTr.Property("ModifierOptions").GetValue<List<EventOption>>() ?? new();
+
+            IReadOnlyList<EventOption> preservedLiveOptions =
+                NeowRewardHelper.ExtractVisibleNonModifierOptions(neow, modifierOptions);
+
+            IReadOnlyList<EventOption> vanillaRewards = NeowRewardHelper.GetOrBuildLiveVanillaRewardsFromCachedKeys(
+                neow,
+                preservedLiveOptions.Count > 0
+                    ? "OnModifierOptionSelected.final.mergeVanilla"
+                    : "OnModifierOptionSelected.final.vanillaOnly"
             );
 
-            SetEventState(neow, initialDescription, new[] { nextModifier });
-            NeowRewardHelper.LogStateJson(neow, $"OnModifierOptionSelected.afterSetNextModifier[{index}]");
-            return;
-        }
+            IReadOnlyList<EventOption> finalOptions = preservedLiveOptions.Count > 0
+                ? NeowRewardHelper.MergeUniqueOptionsInOrder(preservedLiveOptions, vanillaRewards)
+                : vanillaRewards;
 
-        IReadOnlyList<EventOption> rewards = NeowRewardHelper.GetOrBuildLiveVanillaRewardsFromCachedKeys(
-            neow,
-            "OnModifierOptionSelected.final"
-        );
+            ModLog.Debug(
+                $"[Neow/Flow] Final modifier completed for owner={NeowRewardHelper.GetOwnerId(neow)} " +
+                $"preservedLiveCount={preservedLiveOptions.Count} vanillaRewardCount={vanillaRewards.Count} finalCount={finalOptions.Count}"
+            );
+            LogRewardOptions(neow, finalOptions);
 
-        ModLog.Debug(
-            $"[Neow/Flow] Final modifier completed for owner={NeowRewardHelper.GetOwnerId(neow)} liveRewardCount={rewards.Count}"
-        );
-        LogRewardOptions(neow, rewards);
-
-        if (rewards.Count > 0)
-        {
-            if (ModLog.IsTraceEnabled)
+            if (finalOptions.Count > 0)
             {
-                ModLog.Trace(
-                    $"[Neow/Flow] About to show rebuilt rewards page owner={NeowRewardHelper.GetOwnerId(neow)} event={NeowRewardHelper.GetEventIdSafe(neow)} optionCount={rewards.Count} finished={neow.IsFinished}"
-                );
-                NeowLocaleDiagnostics.LogOptions("Neow/Flow.rebuiltPageIdentities", rewards);
-            }
-            SetEventState(neow, initialDescription, rewards);
-            NeowRewardHelper.LogStateJson(neow, $"OnModifierOptionSelected.afterSetRewards[{index}]");
-            return;
-        }
+                if (ModLog.IsTraceEnabled)
+                {
+                    ModLog.Trace(
+                        $"[Neow/Flow] Showing post-modifier rewards page owner={NeowRewardHelper.GetOwnerId(neow)} " +
+                        $"event={NeowRewardHelper.GetEventIdSafe(neow)} optionCount={finalOptions.Count} finished={neow.IsFinished}"
+                    );
+                    NeowLocaleDiagnostics.LogOptions("Neow/Flow.finalPageIdentities", finalOptions);
+                }
 
-        ModLog.Warn(
-            $"[Neow/Flow] No live rewards were available after modifier queue for owner={NeowRewardHelper.GetOwnerId(neow)}; finishing event."
-        );
-        FinishNeowEvent(neow);
+                EnsureNeowIsOpenForRewardPage(neow);
+                SetEventState(neow, rewardPageDescription, finalOptions);
+                NeowRewardHelper.LogStateJson(neow, $"OnModifierOptionSelected.final.afterSetRewards[{index}]");
+                return;
+            }
+
+            ModLog.Warn(
+                $"[Neow/Flow] No post-modifier rewards were available for owner={NeowRewardHelper.GetOwnerId(neow)}; finishing event."
+            );
+            FinishNeowEvent(neow);
+        }
+        catch (Exception ex)
+        {
+            ModLog.Error($"[Neow/Flow] Final modifier reward flow failed for owner={NeowRewardHelper.GetOwnerId(neow)} index={index}: {ex}");
+            FinishNeowEvent(neow);
+        }
     }
 
-    private static object? GetInitialDescription(Traverse neowTr)
+    private static object? GetRewardPageDescription(Neow neow, Traverse neowTr)
     {
-        return neowTr.Property("InitialDescription").GetValue();
+        // Do not reuse Neow.InitialDescription here.
+        //
+        // In custom runs, v0.107.1 overrides InitialDescription to the special
+        // NEOW.EVENT.description text while modifiers are active. Showing that again after
+        // the final modifier makes the reward page look like it is still on the Ancient
+        // dialogue step. Use Neow's vanilla generic DONE description instead: it is an
+        // existing game localization key, so this mod does not need to ship custom text.
+        object? doneDescription = InvokeL10NLookup(neow, $"{GetNeowEntry(neowTr)}.pages.DONE.description");
+        return doneDescription ?? neowTr.Property("InitialDescription").GetValue();
     }
 
     private static void LogRewardOptions(Neow neow, IEnumerable<EventOption> rewards)
@@ -274,6 +298,21 @@ public static class NeowPatch
                 $"textKey={NeowRewardHelper.DebugOptionKey(option)} relic={option?.Relic?.Id?.Entry ?? option?.Relic?.GetType().Name ?? "<none>"}"
             );
             NeowLocaleDiagnostics.LogOption("Neow/Rewards.identity", option);
+        }
+    }
+
+    private static void EnsureNeowIsOpenForRewardPage(Neow neow)
+    {
+        // Some v1.0.7 modifier callbacks can leave the event marked finished before we swap
+        // to the reward page. If that flag stays true, the UI can sit on Neow's/Ancient's
+        // dialogue without accepting reward choices. Re-open it immediately before SetEventState.
+        try
+        {
+            NeowRewardHelper.TrySetInstancePropertyOrBackingField(neow, "IsFinished", false, "re-opening Neow before reward page");
+        }
+        catch (Exception ex)
+        {
+            ModLog.Warn($"[Neow/State] Could not reset IsFinished before reward page: {ex.Message}");
         }
     }
 
@@ -308,20 +347,28 @@ public static class NeowPatch
 
     private static MethodInfo? FindCompatibleSetEventStateMethod(Type neowType, object description)
     {
-        return neowType
-            .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-            .FirstOrDefault(method =>
-            {
-                if (method.Name != "SetEventState")
-                    return false;
+        for (Type? type = neowType; type is not null; type = type.BaseType)
+        {
+            MethodInfo? match = type
+                .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly)
+                .FirstOrDefault(method =>
+                {
+                    if (method.Name != "SetEventState")
+                        return false;
 
-                ParameterInfo[] parameters = method.GetParameters();
-                if (parameters.Length != 2)
-                    return false;
+                    ParameterInfo[] parameters = method.GetParameters();
+                    if (parameters.Length != 2)
+                        return false;
 
-                return parameters[0].ParameterType.IsInstanceOfType(description)
-                    && parameters[1].ParameterType.IsAssignableFrom(typeof(List<EventOption>));
-            });
+                    return parameters[0].ParameterType.IsInstanceOfType(description)
+                        && parameters[1].ParameterType.IsAssignableFrom(typeof(List<EventOption>));
+                });
+
+            if (match is not null)
+                return match;
+        }
+
+        return null;
     }
 
     private static void FinishNeowEvent(Neow neow)
@@ -332,7 +379,7 @@ public static class NeowPatch
 
         object? doneDescription = InvokeL10NLookup(neow, $"{entry}.pages.DONE.description");
         if (doneDescription is null)
-            doneDescription = GetInitialDescription(neowTr);
+            doneDescription = neowTr.Property("InitialDescription").GetValue();
 
         MethodInfo? setEventFinished = FindCompatibleSetEventFinishedMethod(neow.GetType(), doneDescription);
         if (setEventFinished is null)
@@ -355,19 +402,27 @@ public static class NeowPatch
         if (description is null)
             return null;
 
-        return neowType
-            .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-            .FirstOrDefault(method =>
-            {
-                if (method.Name != "SetEventFinished")
-                    return false;
+        for (Type? type = neowType; type is not null; type = type.BaseType)
+        {
+            MethodInfo? match = type
+                .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly)
+                .FirstOrDefault(method =>
+                {
+                    if (method.Name != "SetEventFinished")
+                        return false;
 
-                ParameterInfo[] parameters = method.GetParameters();
-                if (parameters.Length != 1)
-                    return false;
+                    ParameterInfo[] parameters = method.GetParameters();
+                    if (parameters.Length != 1)
+                        return false;
 
-                return parameters[0].ParameterType.IsInstanceOfType(description);
-            });
+                    return parameters[0].ParameterType.IsInstanceOfType(description);
+                });
+
+            if (match is not null)
+                return match;
+        }
+
+        return null;
     }
 
     private static object? InvokeL10NLookup(Neow neow, string key)
@@ -386,10 +441,9 @@ public static class NeowPatch
 }
 
 [HarmonyPatch(typeof(Neow), "GenerateInitialOptions")]
-[HarmonyAfter("ABStS2Mod")]
 public static class NeowGenerateInitialOptionsCachePatch
 {
-    [HarmonyPriority(Priority.Last)]
+    [HarmonyPriority(Priority.Low)]
     private static void Postfix(Neow __instance, ref IReadOnlyList<EventOption> __result)
     {
         // Cache the final blessing result early, before the modifier chain advances.
@@ -401,11 +455,6 @@ public static class NeowGenerateInitialOptionsCachePatch
 
         if (!NeowRewardHelper.IsBuildingRewardsIgnoringModifiers() && owner.RunState.Modifiers.Count > 0)
         {
-            // ABStS2Mod compatibility:
-            // When custom-run modifiers are present, ABStS2Mod's real GenerateInitialOptions postfix
-            // intentionally returns early. The synthetic no-modifier probe inside
-            // GetOrBuildCachedVanillaRewardKeys() is therefore the place where ABStS's
-            // pre-Neow difficulty page can still be generated and cached as generated-only options.
             IReadOnlyList<string> keys = NeowRewardHelper.GetOrBuildCachedVanillaRewardKeys(
                 __instance,
                 "GenerateInitialOptions.Postfix"
@@ -530,6 +579,54 @@ public static class NeowRewardHelper
     [ThreadStatic]
     private static bool _buildingRewardsIgnoringModifiers;
 
+    public static bool TrySetInstancePropertyOrBackingField(object? target, string propertyName, object? value, string reason)
+    {
+        if (target is null)
+            return false;
+
+        Type? targetType = target.GetType();
+        try
+        {
+            PropertyInfo? property = AccessTools.Property(targetType, propertyName);
+            MethodInfo? setter = property?.GetSetMethod(nonPublic: true);
+            if (setter is not null)
+            {
+                setter.Invoke(target, new[] { value });
+                return true;
+            }
+
+            FieldInfo? field = FindInstanceField(targetType, $"<{propertyName}>k__BackingField")
+                ?? FindInstanceField(targetType, "_" + char.ToLowerInvariant(propertyName[0]) + propertyName[1..])
+                ?? FindInstanceField(targetType, char.ToLowerInvariant(propertyName[0]) + propertyName[1..]);
+
+            if (field is null)
+            {
+                ModLog.Warn($"[Reflection] Could not find setter/backing field for {targetType.FullName}.{propertyName} while {reason}.");
+                return false;
+            }
+
+            field.SetValue(target, value);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            ModLog.Warn($"[Reflection] Failed to set {targetType?.FullName}.{propertyName} while {reason}: {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static FieldInfo? FindInstanceField(Type? type, string fieldName)
+    {
+        for (Type? current = type; current is not null; current = current.BaseType)
+        {
+            FieldInfo? field = current.GetField(fieldName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+            if (field is not null)
+                return field;
+        }
+
+        return null;
+    }
+
     private enum CachedRewardSourceKind
     {
         LiveVanilla,
@@ -566,12 +663,32 @@ public static class NeowRewardHelper
         return _buildingRewardsIgnoringModifiers;
     }
 
+    public static bool HasUsableCachedVanillaRewardFallback(Neow neow)
+    {
+        // Only intercept the final modifier hop when we already captured a real fallback page.
+        // If the synthetic cache is missing or empty (for example, CustomStart produced only
+        // navigation/modifier options during the stripped-modifier probe), let vanilla handle
+        // the final transition instead of finishing Neow with an empty page.
+        if (!CachedRewardKeysByNeow.TryGetValue(neow, out CachedRewardKeys? cached))
+            return false;
+
+        bool usable = cached.Options.Count > 0;
+        if (ModLog.IsTraceEnabled)
+        {
+            ModLog.Trace(
+                $"[Neow/Cache] HasUsableCachedVanillaRewardFallback owner={GetOwnerId(neow)} usable={usable} cachedCount={cached.Options.Count} reason={cached.Reason}"
+            );
+        }
+
+        return usable;
+    }
+
+
     /// <summary>
-    /// Build the blessing page by temporarily ignoring custom-run modifiers,
-    /// then cache a lightweight snapshot of the chosen option keys and relic ids.
+    /// Build a VANILLA-ONLY blessing snapshot by temporarily ignoring custom-run modifiers.
     ///
-    /// Vanilla rewards are cached by key so they can be rebuilt from live options later.
-    /// Third-party rewards that only exist in the generated result are kept as generated-option fallbacks.
+    /// This snapshot exists purely so the mod can restore Neow blessings later without
+    /// treating a synthetic stripped-modifier result as authoritative for third-party options.
     /// </summary>
     public static IReadOnlyList<string> GetOrBuildCachedVanillaRewardKeys(Neow neow, string reason)
     {
@@ -582,16 +699,19 @@ public static class NeowRewardHelper
     }
 
     /// <summary>
-    /// Rebuild fresh live EventOptions from neow.AllPossibleOptions using the cached key order.
-    /// This avoids reusing stale vanilla EventOption instances and keeps the live callbacks vanilla.
+    /// Rebuild fresh live VANILLA EventOptions from neow.AllPossibleOptions using the cached key order.
     ///
-    /// If a cached reward came from another mod and only existed in the generated result,
-    /// fall back to that cached generated option so compatibility options like Soul Capture survive.
+    /// Third-party pages should be preserved by the caller from the live event state and merged with
+    /// this vanilla fallback, rather than being inferred from the synthetic snapshot.
     /// </summary>
     public static IReadOnlyList<EventOption> GetOrBuildLiveVanillaRewardsFromCachedKeys(Neow neow, string reason)
     {
-        // Rebuild live rewards from cached snapshot fields using a small cascade of stable match rules
-        // so a locale-sensitive mismatch in one field does not instantly collapse the whole blessing page.
+        // Rebuild fresh live vanilla EventOptions from the cached vanilla-only snapshot.
+        //
+        // This helper is intentionally conservative:
+        // - it never treats the synthetic stripped-modifier snapshot as authoritative for third-party rewards
+        // - it only rebuilds options that can be matched back to live vanilla AllPossibleOptions
+        // - mod-added live pages should be preserved/merged by the caller before falling back here
         CachedRewardKeys snapshot = GetOrBuildCachedRewardSnapshot(neow, reason);
         if (snapshot.Options.Count <= 0)
             return Array.Empty<EventOption>();
@@ -602,7 +722,9 @@ public static class NeowRewardHelper
         NeowLocaleDiagnostics.LogRuntimeLocale("Neow/Rewards.locale");
         if (ModLog.IsTraceEnabled && !NeowLocaleDiagnostics.IsSuspectedIssueLocale())
         {
-            ModLog.Trace($"[Neow/Rewards.locale] Not running in suspected issue locale; gameLocale={NeowLocaleDiagnostics.GetGameLocaleSafe()} osLocale={NeowLocaleDiagnostics.GetOsLocaleSafe()}");
+            ModLog.Trace(
+                $"[Neow/Rewards.locale] Not running in suspected issue locale; gameLocale={NeowLocaleDiagnostics.GetGameLocaleSafe()} osLocale={NeowLocaleDiagnostics.GetOsLocaleSafe()}"
+            );
         }
         NeowLocaleDiagnostics.LogDuplicateIdentities("Neow/Rewards.liveDuplicates", allLiveOptions);
         NeowLocaleDiagnostics.LogOptions("Neow/Rewards.liveAllPossible", allLiveOptions);
@@ -617,24 +739,8 @@ public static class NeowRewardHelper
                 continue;
             }
 
-            if (cached.GeneratedOption is not null)
-            {
-                ModLog.Debug(
-                    $"[Neow/Rewards] Using cached generated reward fallback for owner={GetOwnerId(neow)} reason={reason} " +
-                    $"key={cached.Key} relic={cached.RelicEntry}"
-                );
-
-                AttachDebugBeforeChosen(neow, cached.GeneratedOption, reason);
-                rebuilt.Add(cached.GeneratedOption);
-
-                if (ModLog.IsTraceEnabled)
-                    NeowLocaleDiagnostics.LogOption("Neow/Rewards.generatedFallback", cached.GeneratedOption);
-
-                continue;
-            }
-
             ModLog.Warn(
-                $"[Neow/Rewards] Failed to rebuild reward for owner={GetOwnerId(neow)} key={cached.Key}."
+                $"[Neow/Rewards] Failed to rebuild cached vanilla reward for owner={GetOwnerId(neow)} key={cached.Key} reason={reason}."
             );
             if (ModLog.IsTraceEnabled)
             {
@@ -800,6 +906,88 @@ public static class NeowRewardHelper
         return option?.Relic?.Id?.Entry ?? option?.Relic?.GetType().Name ?? "<none>";
     }
 
+    public static IReadOnlyList<EventOption> ExtractVisibleNonModifierOptions(
+        Neow neow,
+        IEnumerable<EventOption>? modifierOptions)
+    {
+        List<EventOption> currentOptions = neow.CurrentOptions?.ToList() ?? new List<EventOption>();
+        if (currentOptions.Count <= 0)
+            return Array.Empty<EventOption>();
+
+        HashSet<EventOption> modifierRefs = modifierOptions?
+            .Where(option => option is not null)
+            .ToHashSet() ?? new HashSet<EventOption>();
+
+        HashSet<string> modifierKeys = modifierOptions?
+            .Select(DebugOptionKey)
+            .Where(key => !string.IsNullOrWhiteSpace(key) && key != "<null-option>")
+            .ToHashSet(StringComparer.Ordinal) ?? new HashSet<string>(StringComparer.Ordinal);
+
+        List<EventOption> preserved = currentOptions
+            .Where(option =>
+                option is not null
+                && !modifierRefs.Contains(option)
+                && !modifierKeys.Contains(DebugOptionKey(option)))
+            .ToList();
+
+        if (ModLog.IsTraceEnabled)
+        {
+            ModLog.Trace(
+                $"[Neow/Flow] ExtractVisibleNonModifierOptions owner={GetOwnerId(neow)} currentCount={currentOptions.Count} modifierCount={modifierRefs.Count} preservedCount={preserved.Count}"
+            );
+            NeowLocaleDiagnostics.LogOptions("Neow/Flow.currentVisibleOptions", currentOptions);
+            NeowLocaleDiagnostics.LogOptions("Neow/Flow.preservedVisibleOptions", preserved);
+        }
+
+        return preserved;
+    }
+
+    public static IReadOnlyList<EventOption> MergeUniqueOptionsInOrder(
+        IEnumerable<EventOption>? preferredOptions,
+        IEnumerable<EventOption>? appendedOptions)
+    {
+        List<EventOption> merged = new();
+        HashSet<string> seen = new(StringComparer.Ordinal);
+
+        void addRange(IEnumerable<EventOption>? options)
+        {
+            if (options is null)
+                return;
+
+            foreach (EventOption? option in options)
+            {
+                if (option is null)
+                    continue;
+
+                string identity = BuildStableOptionIdentity(option);
+                if (!seen.Add(identity))
+                    continue;
+
+                merged.Add(option);
+            }
+        }
+
+        addRange(preferredOptions);
+        addRange(appendedOptions);
+
+        return merged;
+    }
+
+    private static string BuildStableOptionIdentity(EventOption? option)
+    {
+        string identity = NeowLocaleDiagnostics.BuildRewardIdentity(option);
+        if (!string.IsNullOrWhiteSpace(identity) && identity != NeowLocaleDiagnostics.UnidentifiedIdentity)
+            return identity;
+
+        string debugKey = DebugOptionKey(option);
+        if (!string.IsNullOrWhiteSpace(debugKey) && debugKey != "<null-option>")
+            return $"debug:{debugKey}";
+
+        return option is null
+            ? "null-option"
+            : $"ref:{RuntimeHelpers.GetHashCode(option)}";
+    }
+
     private static CachedRewardKeys GetOrBuildCachedRewardSnapshot(Neow neow, string reason)
     {
         if (CachedRewardKeysByNeow.TryGetValue(neow, out CachedRewardKeys? cached))
@@ -823,17 +1011,29 @@ public static class NeowRewardHelper
         if (owner is null)
             return Array.Empty<string>();
 
-        var runStateTr = Traverse.Create(owner.RunState);
-        var modifiersProperty = runStateTr.Property("Modifiers");
+        var rngProperty = neowTr.Property("Rng");
 
         IReadOnlyList<ModifierModel> savedModifiers =
-            modifiersProperty.GetValue<IReadOnlyList<ModifierModel>>() ?? Array.Empty<ModifierModel>();
+            owner.RunState.Modifiers ?? Array.Empty<ModifierModel>();
+
+        Rng? savedRng = rngProperty.GetValue<Rng>();
+        Rng? syntheticRng = savedRng is null
+            ? null
+            : new Rng(savedRng.Seed, savedRng.Counter);
 
         try
         {
             _buildingRewardsIgnoringModifiers = true;
-            // Traverse can temporarily replace a property value through reflection.
-            modifiersProperty.SetValue((IReadOnlyList<ModifierModel>)Array.Empty<ModifierModel>());
+
+            // Temporarily remove custom modifiers and ask vanilla Neow which blessings it would
+            // have shown. In v1.0.7 GenerateInitialOptions consumes Neow.Rng while choosing the
+            // curse/positive relics, so run the synthetic lookup on a cloned RNG and restore the
+            // real RNG afterwards. Otherwise this diagnostic/fallback cache changes actual run RNG.
+            if (!TrySetInstancePropertyOrBackingField(owner.RunState, "Modifiers", new List<ModifierModel>(), "building vanilla Neow reward cache"))
+                return Array.Empty<string>();
+
+            if (syntheticRng is not null)
+                TrySetInstancePropertyOrBackingField(neow, "Rng", syntheticRng, "building vanilla Neow reward cache");
 
             MethodInfo? generateInitialOptionsMethod = AccessTools.Method(typeof(Neow), "GenerateInitialOptions");
             if (generateInitialOptionsMethod is null)
@@ -845,82 +1045,87 @@ public static class NeowRewardHelper
             IReadOnlyList<EventOption> generated =
                 generateInitialOptionsMethod.Invoke(neow, Array.Empty<object>()) as IReadOnlyList<EventOption>
                 ?? Array.Empty<EventOption>();
-HashSet<string> liveKeys = (neow.AllPossibleOptions ?? Array.Empty<EventOption>())
-    .Select(NeowLocaleDiagnostics.BuildRewardIdentity)
-    .Where(identity => !string.IsNullOrEmpty(identity) && identity != NeowLocaleDiagnostics.UnidentifiedIdentity)
-    .ToHashSet();
 
-NeowLocaleDiagnostics.LogRuntimeLocale("Neow/Cache.locale");
-if (ModLog.IsTraceEnabled && !NeowLocaleDiagnostics.IsSuspectedIssueLocale())
-{
-    ModLog.Trace($"[Neow/Cache.locale] Not running in suspected issue locale; gameLocale={NeowLocaleDiagnostics.GetGameLocaleSafe()} osLocale={NeowLocaleDiagnostics.GetOsLocaleSafe()}");
-}
-NeowLocaleDiagnostics.LogDuplicateIdentities("Neow/Cache.generatedDuplicates", generated);
-NeowLocaleDiagnostics.LogDuplicateIdentities("Neow/Cache.liveDuplicates", neow.AllPossibleOptions ?? Array.Empty<EventOption>());
-NeowLocaleDiagnostics.LogOptions("Neow/Cache.generated", generated);
-NeowLocaleDiagnostics.LogOptions("Neow/Cache.liveAllPossible", neow.AllPossibleOptions ?? Array.Empty<EventOption>());
+            HashSet<string> liveKeys = (neow.AllPossibleOptions ?? Array.Empty<EventOption>())
+                .Select(NeowLocaleDiagnostics.BuildRewardIdentity)
+                .Where(identity => !string.IsNullOrEmpty(identity) && identity != NeowLocaleDiagnostics.UnidentifiedIdentity)
+                .ToHashSet();
 
-CachedRewardKeys snapshot = new()
-{
-    Options = generated
-        .Select(option =>
-        {
-            string key = NeowLocaleDiagnostics.BuildRewardIdentity(option);
-            string debugKey = DebugOptionKey(option);
-            string textKey = option?.TextKey ?? string.Empty;
-            string titleLocTable = option?.Title?.LocTable ?? string.Empty;
-            string titleLocKey = option?.Title?.LocEntryKey ?? string.Empty;
-            string relicEntry = GetRelicEntry(option);
-            bool hasLiveMatch = !string.IsNullOrEmpty(key)
-                && key != NeowLocaleDiagnostics.UnidentifiedIdentity
-                && liveKeys.Contains(key);
-
-            return new CachedRewardOption
+            NeowLocaleDiagnostics.LogRuntimeLocale("Neow/Cache.locale");
+            if (ModLog.IsTraceEnabled && !NeowLocaleDiagnostics.IsSuspectedIssueLocale())
             {
-                Key = key,
-                DebugKey = debugKey,
-                TextKey = textKey,
-                TitleLocTable = titleLocTable,
-                TitleLocKey = titleLocKey,
-                RelicEntry = relicEntry,
-                SourceKind = hasLiveMatch ? CachedRewardSourceKind.LiveVanilla : CachedRewardSourceKind.GeneratedOnly,
-                GeneratedOption = hasLiveMatch ? null : option
-            };
-        })
-        .Where(entry => !string.IsNullOrEmpty(entry.Key) && entry.Key != NeowLocaleDiagnostics.UnidentifiedIdentity)
-        .ToList(),
-    Reason = reason
-};
+                ModLog.Trace(
+                    $"[Neow/Cache.locale] Not running in suspected issue locale; gameLocale={NeowLocaleDiagnostics.GetGameLocaleSafe()} osLocale={NeowLocaleDiagnostics.GetOsLocaleSafe()}"
+                );
+            }
+            NeowLocaleDiagnostics.LogDuplicateIdentities("Neow/Cache.generatedDuplicates", generated);
+            NeowLocaleDiagnostics.LogDuplicateIdentities("Neow/Cache.liveDuplicates", neow.AllPossibleOptions ?? Array.Empty<EventOption>());
+            NeowLocaleDiagnostics.LogOptions("Neow/Cache.generated", generated);
+            NeowLocaleDiagnostics.LogOptions("Neow/Cache.liveAllPossible", neow.AllPossibleOptions ?? Array.Empty<EventOption>());
 
-snapshot.Keys = snapshot.Options.Select(option => option.Key).ToList();
-snapshot.DebugKeys = snapshot.Options.Select(option => option.DebugKey).ToList();
-snapshot.TextKeys = snapshot.Options.Select(option => option.TextKey).ToList();
-snapshot.TitleLocKeys = snapshot.Options.Select(option => option.TitleLocKey).ToList();
-snapshot.RelicEntries = snapshot.Options.Select(option => option.RelicEntry).ToList();
+            List<CachedRewardOption> vanillaOnlyOptions = generated
+                .Select(option =>
+                {
+                    string key = NeowLocaleDiagnostics.BuildRewardIdentity(option);
+
+                    return new CachedRewardOption
+                    {
+                        Key = key,
+                        DebugKey = DebugOptionKey(option),
+                        TextKey = option?.TextKey ?? string.Empty,
+                        TitleLocTable = option?.Title?.LocTable ?? string.Empty,
+                        TitleLocKey = option?.Title?.LocEntryKey ?? string.Empty,
+                        RelicEntry = GetRelicEntry(option),
+                        SourceKind = CachedRewardSourceKind.LiveVanilla,
+                        GeneratedOption = null
+                    };
+                })
+                .Where(entry =>
+                    !string.IsNullOrEmpty(entry.Key)
+                    && entry.Key != NeowLocaleDiagnostics.UnidentifiedIdentity
+                    && liveKeys.Contains(entry.Key))
+                .ToList();
+
+            CachedRewardKeys snapshot = new()
+            {
+                Options = vanillaOnlyOptions,
+                Reason = reason
+            };
+
+            snapshot.Keys = snapshot.Options.Select(option => option.Key).ToList();
+            snapshot.DebugKeys = snapshot.Options.Select(option => option.DebugKey).ToList();
+            snapshot.TextKeys = snapshot.Options.Select(option => option.TextKey).ToList();
+            snapshot.TitleLocKeys = snapshot.Options.Select(option => option.TitleLocKey).ToList();
+            snapshot.RelicEntries = snapshot.Options.Select(option => option.RelicEntry).ToList();
 
             CachedRewardKeysByNeow.Remove(neow);
             CachedRewardKeysByNeow.Add(neow, snapshot);
 
             ModLog.Debug(
-                $"[Neow/Cache] Built cached reward snapshot for owner={GetOwnerId(owner)} reason={reason} count={snapshot.Keys.Count}"
+                $"[Neow/Cache] Built cached vanilla reward snapshot for owner={GetOwnerId(owner)} reason={reason} count={snapshot.Keys.Count}"
             );
             if (ModLog.IsTraceEnabled)
             {
+                IEnumerable<string> discardedKeys = generated
+                    .Select(NeowLocaleDiagnostics.BuildRewardIdentity)
+                    .Where(identity =>
+                        !string.IsNullOrEmpty(identity)
+                        && identity != NeowLocaleDiagnostics.UnidentifiedIdentity
+                        && !liveKeys.Contains(identity))
+                    .Distinct()
+                    .OrderBy(identity => identity);
+
                 ModLog.Trace(
-                    $"[Neow/Cache] owner={GetOwnerId(owner)} keys={string.Join(",", snapshot.Keys)} relics={string.Join(",", snapshot.RelicEntries)} " +
-                    $"generatedOnlyKeys={string.Join(",", snapshot.Options.Where(option => option.SourceKind == CachedRewardSourceKind.GeneratedOnly).Select(option => option.Key))}"
+                    $"[Neow/Cache] owner={GetOwnerId(owner)} keys={string.Join(",", snapshot.Keys)} relics={string.Join(",", snapshot.RelicEntries)}"
                 );
-                if (snapshot.Options.Any(option => option.SourceKind == CachedRewardSourceKind.GeneratedOnly))
-                {
-                    ModLog.Trace(
-                        $"[Neow/Cache] owner={GetOwnerId(owner)} preserving generated-only options for final-page fallback."
-                    );
-                }
                 ModLog.Trace(
                     $"[Neow/Cache] owner={GetOwnerId(owner)} debugKeys={string.Join(",", snapshot.DebugKeys)}"
                 );
                 ModLog.Trace(
                     $"[Neow/Cache] owner={GetOwnerId(owner)} textKeys={string.Join(",", snapshot.TextKeys)} locKeys={string.Join(",", snapshot.TitleLocKeys)}"
+                );
+                ModLog.Trace(
+                    $"[Neow/Cache] owner={GetOwnerId(owner)} discardedNonVanillaKeys={string.Join(",", discardedKeys)}"
                 );
             }
 
@@ -933,7 +1138,9 @@ snapshot.RelicEntries = snapshot.Options.Select(option => option.RelicEntry).ToL
         }
         finally
         {
-            modifiersProperty.SetValue(savedModifiers);
+            TrySetInstancePropertyOrBackingField(owner.RunState, "Modifiers", savedModifiers, "restoring modifiers after vanilla Neow reward cache");
+            if (savedRng is not null)
+                TrySetInstancePropertyOrBackingField(neow, "Rng", savedRng, "restoring Neow RNG after vanilla reward cache");
             _buildingRewardsIgnoringModifiers = false;
         }
     }
