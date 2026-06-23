@@ -17,6 +17,7 @@ using MegaCrit.Sts2.Core.Logging;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Models.Events;
 using MegaCrit.Sts2.Core.Multiplayer.Game;
+using MegaCrit.Sts2.Core.Multiplayer.Messages.Game.Sync;
 using MegaCrit.Sts2.Core.Random;
 using Logger = MegaCrit.Sts2.Core.Logging.Logger;
 
@@ -505,6 +506,162 @@ public static class NeowGenerateInitialOptionsCachePatch
 }
 
 [HarmonyPatch]
+public static class EventSynchronizerRemoteNeowChoiceQueuePatch
+{
+    private sealed class QueueState
+    {
+        public readonly object Gate = new();
+        public Task Tail = Task.CompletedTask;
+    }
+
+    private static readonly ConditionalWeakTable<EventSynchronizer, QueueState> Queues = new();
+
+    private static MethodBase TargetMethod()
+    {
+        return AccessTools.Method(
+            typeof(EventSynchronizer),
+            "HandleEventOptionChosenMessage",
+            new[] { typeof(OptionIndexChosenMessage), typeof(ulong) }
+        )!;
+    }
+
+    private static bool Prefix(EventSynchronizer __instance, OptionIndexChosenMessage message, ulong senderId)
+    {
+        if (message.type != OptionIndexType.Event)
+            return true;
+
+        Player? player = GetPlayer(__instance, senderId);
+        if (player is null)
+            return true;
+
+        EventModel? eventForPlayer = GetEventForPlayerSafe(__instance, player);
+        if (!IsNeowEvent(eventForPlayer))
+            return true;
+
+        QueueState state = Queues.GetValue(__instance, _ => new QueueState());
+        lock (state.Gate)
+        {
+            state.Tail = RunAfterPreviousRemoteNeowChoice(
+                __instance,
+                state.Tail,
+                player,
+                (int)message.optionIndex,
+                senderId
+            );
+        }
+
+        return false;
+    }
+
+    private static async Task RunAfterPreviousRemoteNeowChoice(
+        EventSynchronizer synchronizer,
+        Task previous,
+        Player player,
+        int optionIndex,
+        ulong senderId)
+    {
+        try
+        {
+            await previous;
+
+            // EventSynchronizer normally queues EventOption.Chosen() tasks and immediately
+            // accepts the next network message. That is too racy for Neow modifier chains:
+            // a remote client can reach our injected vanilla reward page and send option 2
+            // while this peer's remote copy is still on the one-option modifier page.
+            await WaitForPendingEventOptionTasks(synchronizer);
+
+            EventModel eventForPlayer = synchronizer.GetEventForPlayer(player);
+            if (eventForPlayer.IsFinished)
+            {
+                ModLog.Trace(
+                    $"[Neow/EventSync.remoteQueue] sender={senderId} player={NeowRewardHelper.GetOwnerId(player)} " +
+                    $"option={optionIndex} ignored because event is already finished."
+                );
+                return;
+            }
+
+            ModLog.Debug(
+                $"[Neow/EventSync.remoteQueue] applying queued remote Neow choice sender={senderId} " +
+                $"player={NeowRewardHelper.GetOwnerId(player)} option={optionIndex} currentCount={eventForPlayer.CurrentOptions.Count}"
+            );
+
+            MethodInfo? choose = AccessTools.Method(
+                typeof(EventSynchronizer),
+                "ChooseOptionForEvent",
+                new[] { typeof(Player), typeof(int) }
+            );
+
+            if (choose is null)
+            {
+                ModLog.Error("[Neow/EventSync.remoteQueue] Could not find EventSynchronizer.ChooseOptionForEvent.");
+                return;
+            }
+
+            choose.Invoke(synchronizer, new object[] { player, optionIndex });
+        }
+        catch (Exception ex)
+        {
+            ModLog.Error(
+                $"[Neow/EventSync.remoteQueue] Failed applying queued remote Neow choice " +
+                $"sender={senderId} player={NeowRewardHelper.GetOwnerId(player)} option={optionIndex}: {UnwrapReflectionException(ex)}"
+            );
+        }
+    }
+
+    private static async Task WaitForPendingEventOptionTasks(EventSynchronizer synchronizer)
+    {
+        for (int i = 0; i < 20; i++)
+        {
+            List<Task> pending =
+                Traverse.Create(synchronizer).Field("_pendingOptionTasks").GetValue<List<Task>>() ?? new();
+
+            Task[] unfinished = pending.Where(task => task is { IsCompleted: false }).ToArray();
+            if (unfinished.Length == 0)
+                return;
+
+            await Task.WhenAll(unfinished);
+        }
+    }
+
+    private static Player? GetPlayer(EventSynchronizer synchronizer, ulong senderId)
+    {
+        object? playerCollection = Traverse.Create(synchronizer).Field("_playerCollection").GetValue();
+        MethodInfo? getPlayer = playerCollection?.GetType().GetMethod("GetPlayer", new[] { typeof(ulong) });
+        return getPlayer?.Invoke(playerCollection, new object[] { senderId }) as Player;
+    }
+
+    private static EventModel? GetEventForPlayerSafe(EventSynchronizer synchronizer, Player player)
+    {
+        try
+        {
+            return synchronizer.GetEventForPlayer(player);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool IsNeowEvent(EventModel? eventModel)
+    {
+        if (eventModel is not Neow)
+            return false;
+
+        string id = NeowRewardHelper.GetEventIdSafe(eventModel);
+        return string.Equals(id, "NEOW", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(id, "EVENT.NEOW", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static Exception UnwrapReflectionException(Exception ex)
+    {
+        return ex is TargetInvocationException { InnerException: not null } tie
+            ? tie.InnerException
+            : ex;
+    }
+}
+
+
+[HarmonyPatch]
 public static class EventSynchronizerChooseOptionForEventLogPatch
 {
     private const string LogPrefix = "[NeowAlwaysRewards]";
@@ -552,22 +709,72 @@ public static class EventSynchronizerChooseOptionForEventLogPatch
             EventModel eventForPlayer = __instance.GetEventForPlayer(player);
             IReadOnlyList<EventOption> currentOptions = eventForPlayer.CurrentOptions;
 
-            ModLog.Debug(
-                $"[Neow/EventSync.afterChoose] player={NeowRewardHelper.GetOwnerId(player)} " +
-                $"event={NeowRewardHelper.GetEventIdSafe(eventForPlayer)} finished={eventForPlayer.IsFinished} " +
-                $"chosenIndex={optionIndex} currentCount={currentOptions.Count}"
-            );
             if (ModLog.IsTraceEnabled)
             {
                 ModLog.Trace(
-                    $"[Neow/EventSync.afterChoose] player={NeowRewardHelper.GetOwnerId(player)} " +
-                    $"event={NeowRewardHelper.GetEventIdSafe(eventForPlayer)} currentKeys={NeowRewardHelper.DebugOptionKeys(currentOptions)}"
+                    $"[Neow/EventSync.afterChoose.queued] player={NeowRewardHelper.GetOwnerId(player)} " +
+                    $"event={NeowRewardHelper.GetEventIdSafe(eventForPlayer)} finished={eventForPlayer.IsFinished} " +
+                    $"chosenIndex={optionIndex} currentCount={currentOptions.Count} " +
+                    $"currentKeys={NeowRewardHelper.DebugOptionKeys(currentOptions)}"
                 );
             }
         }
         catch (Exception ex)
         {
             ModLog.Error($"[Neow/EventSync.afterChoose] logging failed: {ex}");
+        }
+    }
+}
+
+[HarmonyPatch(typeof(EventOption), nameof(EventOption.Chosen))]
+public static class EventOptionChosenCompletedLogPatch
+{
+    private static void Postfix(EventOption __instance, Task __result)
+    {
+        try
+        {
+            if (!NeowRewardHelper.TryGetTrackedLiveRewardOwner(__instance, out Neow? neow) || neow is null)
+                return;
+
+            _ = LogAfterChosenCompletes(__result, __instance, neow);
+        }
+        catch (Exception ex)
+        {
+            ModLog.Error($"[Neow/Rewards] LiveReward.AfterChosen hook failed: {ex}");
+        }
+    }
+
+    private static async Task LogAfterChosenCompletes(Task chosenTask, EventOption option, Neow neow)
+    {
+        try
+        {
+            await chosenTask;
+
+            IReadOnlyList<EventOption> currentOptions = neow.CurrentOptions;
+            ModLog.Debug(
+                $"[Neow/Rewards] LiveReward.AfterChosen owner={NeowRewardHelper.GetOwnerId(neow)} " +
+                $"event={NeowRewardHelper.GetEventIdSafe(neow)} key={NeowRewardHelper.DebugOptionKey(option)} " +
+                $"finished={neow.IsFinished} currentCount={currentOptions.Count} " +
+                $"stillVisible={currentOptions.Contains(option)}"
+            );
+
+            if (ModLog.IsTraceEnabled)
+            {
+                ModLog.Trace(
+                    $"[Neow/Rewards] LiveReward.AfterChosen owner={NeowRewardHelper.GetOwnerId(neow)} " +
+                    $"currentKeys={NeowRewardHelper.DebugOptionKeys(currentOptions)}"
+                );
+                NeowLocaleDiagnostics.LogOptions("Neow/Rewards.afterChosenVisibleIdentities", currentOptions);
+            }
+
+            NeowRewardHelper.LogStateJson(neow, $"LiveReward.afterChosen[{NeowRewardHelper.DebugOptionKey(option)}]");
+        }
+        catch (Exception ex)
+        {
+            ModLog.Error(
+                $"[Neow/Rewards] LiveReward.AfterChosen failed owner={NeowRewardHelper.GetOwnerId(neow)} " +
+                $"key={NeowRewardHelper.DebugOptionKey(option)}: {ex}"
+            );
         }
     }
 }
@@ -1146,9 +1353,26 @@ public static class NeowRewardHelper
     }
 
     private static readonly ConditionalWeakTable<EventOption, HashSet<string>> BeforeChosenDebugReasonsByOption = new();
+    private static readonly ConditionalWeakTable<EventOption, Neow> LiveRewardOwnerByOption = new();
+
+    public static bool TryGetTrackedLiveRewardOwner(EventOption option, out Neow? neow)
+    {
+        return LiveRewardOwnerByOption.TryGetValue(option, out neow);
+    }
+
+    private static void TrackLiveRewardOwner(Neow neow, EventOption option)
+    {
+        // Rebuilt reward options are live vanilla EventOption instances. Track them so the
+        // EventOption.Chosen postfix can log the real post-await state, after the reward's
+        // own async OnChosen callback has finished.
+        LiveRewardOwnerByOption.Remove(option);
+        LiveRewardOwnerByOption.Add(option, neow);
+    }
 
     private static void AttachDebugBeforeChosen(Neow neow, EventOption option, string reason)
     {
+        TrackLiveRewardOwner(neow, option);
+
         // Avoid stacking identical debug handlers on the same EventOption instance across retries.
         HashSet<string> attachedReasons = BeforeChosenDebugReasonsByOption.GetValue(option, _ => new HashSet<string>());
         string attachmentKey = $"{GetOwnerId(neow)}::{reason}";
