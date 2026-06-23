@@ -44,6 +44,8 @@ This mod is designed to be relatively friendly to other mods that modify Neow re
 - add more rewards to the pool
 - append a fourth choice
 - alter the final returned option list
+This Mod is compatible with ChooseTheAncient on Sts2 v1.071 (A much bigger mod)
+- NeowAlwaysRewards is redundant though so I don't recommend using them together.
 
 Patch order can still matter when multiple mods postfix the same method if you also use Harmony Priority Low.
 
