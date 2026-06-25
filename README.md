@@ -2,7 +2,7 @@
 
 NeowAlwaysRewards allows Neow rewards to show in Custom Mode and Daily Challenge runs, not just standard runs. (Now works for Multiplayer)
 (Works with Sts2 v0.107.1)
-<img src="NeowAlwaysRewards/NeowAlwaysRewards.gif" alt="Alt Text" width="480" />
+<img src="https://raw.githubusercontent.com/ResistingFate/NeowAlwaysRewards/main/workshop/NeowAlwaysRewards.gif" alt="Alt Text" width="480" />
 
 Notice how you can select Specialist > Insanity > All Stars > and Still get Neow Blessings
 
